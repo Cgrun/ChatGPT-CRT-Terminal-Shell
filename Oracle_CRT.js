@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         J's Oracle CRT Terminal Shell for ChatGPT v14.7
+// @name         J's Oracle CRT Terminal Shell for ChatGPT v14.9 Standby Toggle
 // @namespace    js-oracle-crt-chatgpt-v14
-// @version      1.4.7
-// @description  V14.7 WebGL curved CRT terminal shell for ChatGPT. Performance optimized. Fixes input sync, caret rendering, code formatting, transparent copy buttons, visible thinking titles, and send behavior.
+// @version      1.4.9
+// @description  A retro WebGL CRT terminal interface for ChatGPT with curved-screen rendering, inline terminal input, popup composer, visible thinking-status display, preserved code formatting, glowing copy-code controls, and persistent SCRIPT ON/OFF standby toggle.
 // @author       CrJia
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -16,6 +16,7 @@
   const ROOT_ID = "oracle-crt-v14-root";
   const STYLE_ID = "oracle-crt-v14-style";
   const ROOT_CLASS = "oracle-crt-v14-on";
+  const STANDBY_CLASS = "oracle-v14-standby";
   const STORE_ON = "oracleCrtV14Enabled";
 
   const MAX_MESSAGES = 12;
@@ -249,6 +250,75 @@
         color: var(--oracle-amber);
       }
 
+      #${ROOT_ID}.${STANDBY_CLASS} {
+        background: transparent !important;
+        pointer-events: none !important;
+      }
+
+      #${ROOT_ID}.${STANDBY_CLASS} .oracle-v14-main,
+      #${ROOT_ID}.${STANDBY_CLASS} .oracle-v14-popup {
+        display: none !important;
+      }
+
+      #${ROOT_ID}.${STANDBY_CLASS} .oracle-v14-bottom-bar {
+        pointer-events: auto !important;
+        background: transparent !important;
+      }
+
+      #${ROOT_ID}.${STANDBY_CLASS} .oracle-v14-bottom-bar .oracle-v14-btn:not([data-action="toggle-shell"]) {
+        visibility: hidden !important;
+        pointer-events: none !important;
+      }
+
+      #${ROOT_ID}.${STANDBY_CLASS} .oracle-v14-bottom-bar .oracle-v14-btn[data-action="toggle-shell"] {
+        visibility: visible !important;
+        pointer-events: auto !important;
+      }
+
+      #${ROOT_ID}.oracle-v14-booting {
+        pointer-events: auto !important;
+      }
+
+      .oracle-v14-boot-overlay {
+        position: absolute;
+        inset: 0;
+        z-index: 2147483647;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0, 0, 0, 1);
+        pointer-events: auto;
+        opacity: 0;
+        /* 先渐入，再渐出 */
+        transition:
+          opacity 360ms ease-out,
+          background 360ms ease-out;
+      }
+
+      .oracle-v14-boot-overlay.show {
+        opacity: 1;
+      }
+
+      .oracle-v14-boot-overlay.hide {
+        opacity: 0;
+      }
+
+      .oracle-v14-boot-logo {
+        white-space: pre;
+        color: var(--oracle-select);
+        font-family: var(--oracle-font) !important;
+        font-size: clamp(11px, 1.45vw, 20px);
+        line-height: 1.05;
+        letter-spacing: 0.03em;
+        text-align: left;
+        transform: translateY(-48px);
+        text-shadow:
+           0 0 1px rgba(255, 255, 210, 1),
+           0 0 5px rgba(255, 207, 3, 0.95),
+           0 0 14px rgba(255, 154, 0, 0.85),
+           0 0 32px rgba(255, 102, 0, 0.55),
+           0 0 58px rgba(255, 80, 0, 0.35);
+      }
       .oracle-v14-main {
         position: absolute;
         inset: 0 0 48px 0;
@@ -839,6 +909,7 @@
       state.popup.thinking = !state.popup.thinking;
       updatePopups();
       refreshThinkingPopup();
+      scheduleSync(40);
     });
 
     bind("chatbox", () => {
@@ -846,8 +917,21 @@
     });
 
     bind("toggle-shell", () => {
-      setBool(STORE_ON, false);
-      disableShell();
+      const nowOn = document.documentElement.classList.contains(ROOT_CLASS);
+
+      showBootOverlay(2000);
+
+      afterOverlayPaint(() => {
+        if (nowOn) {
+          setBool(STORE_ON, false);
+          disableShell();
+        } else {
+          setBool(STORE_ON, true);
+          enableShell();
+        }
+
+        updateToggleButtonLabel();
+      });
     });
 
     bind("send", () => {
@@ -933,17 +1017,103 @@
     });
   }
 
+  function updateToggleButtonLabel() {
+    const root = document.getElementById(ROOT_ID);
+    if (!root) return;
+
+    const btn = root.querySelector('[data-action="toggle-shell"]');
+    if (!btn) return;
+
+    const isOn = document.documentElement.classList.contains(ROOT_CLASS);
+    btn.textContent = isOn ? "SCRIPT OFF" : "SCRIPT ON";
+  }
+
+  function showBootOverlay(duration = 2000) {
+    const root = document.getElementById(ROOT_ID);
+    if (!root) return null;
+
+    const old = root.querySelector(".oracle-v14-boot-overlay");
+    if (old) old.remove();
+
+    root.classList.add("oracle-v14-booting");
+
+    const overlay = document.createElement("div");
+    overlay.className = "oracle-v14-boot-overlay";
+
+    const logo = document.createElement("pre");
+    logo.className = "oracle-v14-boot-logo";
+    logo.textContent = String.raw`
+         ::::::::  :::::::::  ::::::::::: :::::::::::     :::
+        :+:    :+: :+:    :+:     :+:         :+:       :+: :+:
+       +:+        +:+    +:+     +:+         +:+      +:+   +:+
+      +#+        +#++:++#:      +#+         +#+     +#++:++#++:
+     +#+        +#+    +#+     +#+         +#+     +#+     +#+
+    #+#    #+# #+#    #+#     #+#         #+#     #+#     #+#
+    ########  ###    ###  #####      ########### ###     ###
+  `.trimEnd();
+
+    overlay.appendChild(logo);
+    root.appendChild(overlay);
+
+    /* 强制让浏览器先记录初始 opacity: 0 */
+    overlay.getBoundingClientRect();
+
+    /* 下一帧进入 opacity: 1，实现渐入 */
+    requestAnimationFrame(() => {
+      overlay.classList.add("show");
+    });
+
+    /* 2 秒总时长，最后 360ms 渐出 */
+    setTimeout(() => {
+      overlay.classList.remove("show");
+      overlay.classList.add("hide");
+    }, Math.max(0, duration - 360));
+
+    setTimeout(() => {
+      overlay.remove();
+      root.classList.remove("oracle-v14-booting");
+    }, duration);
+
+    return overlay;
+  }
+
+  function afterOverlayPaint(fn) {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        setTimeout(fn, 0);
+      });
+    });
+  }
   function disableShell() {
     restoreNativeComposer();
+
+    state.popup.sidebar = false;
+    state.popup.thinking = false;
+    state.popup.chatbox = false;
+    updatePopups();
+
     document.documentElement.classList.remove(ROOT_CLASS);
-    if (shell) shell.hidden = true;
+
+    if (shell) {
+      shell.hidden = false;
+      shell.classList.add(STANDBY_CLASS);
+    }
+
+    state.shellOn = false;
+    updateToggleButtonLabel();
   }
 
   function enableShell() {
     document.documentElement.classList.add(ROOT_CLASS);
-    if (shell) shell.hidden = false;
+
+    if (shell) {
+      shell.hidden = false;
+      shell.classList.remove(STANDBY_CLASS);
+    }
+
     state.shellOn = true;
     setBool(STORE_ON, true);
+    updateToggleButtonLabel();
     scheduleSync(50);
     requestRender();
   }
@@ -1358,7 +1528,59 @@
       .replace(/\r\n/g, "\n")
       .replace(/\r/g, "\n")
       .replace(/\u00a0/g, " ")
+      .replace(/[\u200B-\u200D\uFEFF]/g, "")
+      .replace(/^\n+/, "")
       .replace(/\n+$/g, "");
+  }
+
+  function scoreCodeTextForIndentation(str) {
+    const lines = String(str || "").split("\n");
+    let score = 0;
+
+    score += lines.length * 3;
+
+    lines.forEach((line) => {
+      if (/^[ \t]+/.test(line)) score += 5;
+      if (line.includes("  ")) score += 1;
+      if (/[{}()[\];,:]/.test(line)) score += 1;
+    });
+
+    return score;
+  }
+
+  function extractRawCodeTextFromPre(preEl) {
+    if (!preEl) return "";
+
+    const codeEl = preEl.querySelector("code") || preEl;
+
+    const lineNodes = Array.from(
+      codeEl.querySelectorAll('[data-line], [data-testid*="line" i], [class~="line"]')
+    ).filter((node) => {
+      const text = node.textContent || "";
+      return text.length > 0;
+    });
+
+    if (lineNodes.length >= 2) {
+      const byLines = lineNodes
+        .map((node) => node.textContent || "")
+        .join("\n");
+
+      const normalizedByLines = normalizeCodeText(byLines);
+
+      if (normalizedByLines.trim()) {
+        return normalizedByLines;
+      }
+    }
+
+    const fromTextContent = normalizeCodeText(codeEl.textContent || "");
+    const fromInnerText = normalizeCodeText(codeEl.innerText || "");
+
+    if (!fromTextContent) return fromInnerText;
+    if (!fromInnerText) return fromTextContent;
+
+    return scoreCodeTextForIndentation(fromInnerText) > scoreCodeTextForIndentation(fromTextContent)
+      ? fromInnerText
+      : fromTextContent;
   }
 
   function extractMessageSegments(root) {
@@ -1410,13 +1632,13 @@
       if (tag === "PRE") {
         flushProse();
 
-        const codeNode = el.querySelector("code") || el;
-        const codeText = normalizeCodeText(codeNode.textContent || codeNode.innerText || "");
+        const codeText = extractRawCodeTextFromPre(el);
 
         if (codeText.trim()) {
           segments.push({
             type: "code",
-            text: codeText
+            text: codeText,
+            copyText: codeText
           });
         }
 
@@ -1455,9 +1677,17 @@
     return segments;
   }
 
-  function cleanThinkingTitle(raw) {
-    const firstLine = String(raw || "")
+  function cleanThinkingText(raw) {
+    return String(raw || "")
       .replace(/\u00a0/g, " ")
+      .replace(/\s+\n/g, "\n")
+      .replace(/\n\s+/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
+  function cleanThinkingTitle(raw) {
+    const firstLine = cleanThinkingText(raw)
       .split(/\n+/)
       .map((x) => x.trim())
       .find(Boolean) || "";
@@ -1469,47 +1699,69 @@
       .trim();
   }
 
-  function extractThinkingModuleTitle(el) {
-    if (!el) return "";
+  function looksLikeThinkingText(raw) {
+    return /(thinking|reasoning|reasoned|thought|analyz|analysis|search|reading|browse|tool|思考|推理|分析|搜索|检索|浏览|读取|工具)/i.test(String(raw || ""));
+  }
+
+  function looksLikeNonThinkingUi(raw) {
+    return /(model|selector|sidebar|history|conversation|menu|gpt|o3|o4|4o|share|copy|edit|retry|模型|侧边栏|历史|菜单)/i.test(String(raw || ""));
+  }
+
+  function extractThinkingBlock(el) {
+    if (!el) return null;
 
     const summary = el.matches && el.matches("details")
       ? el.querySelector("summary")
       : null;
 
-    const aria = el.getAttribute ? el.getAttribute("aria-label") : "";
-    const testid = el.getAttribute ? el.getAttribute("data-testid") : "";
+    const aria = el.getAttribute ? el.getAttribute("aria-label") || "" : "";
+    const testid = el.getAttribute ? el.getAttribute("data-testid") || "" : "";
 
-    const raw =
-      cleanThinkingTitle(summary ? txt(summary) : "") ||
+    const fullText = cleanThinkingText(el.innerText || el.textContent || "");
+    const summaryText = cleanThinkingText(summary ? (summary.innerText || summary.textContent || "") : "");
+
+    const title =
+      cleanThinkingTitle(summaryText) ||
       cleanThinkingTitle(aria) ||
-      cleanThinkingTitle(txt(el)) ||
+      cleanThinkingTitle(fullText) ||
       cleanThinkingTitle(testid);
 
-    if (!raw) return "";
+    if (!title && !fullText) return null;
 
-    const lower = raw.toLowerCase();
+    const combined = `${title}\n${fullText}\n${aria}\n${testid}`;
 
-    if (/model|selector|sidebar|history|conversation|menu|gpt|o3|o4|4o|模型|侧边栏|历史/.test(lower)) {
-      return "";
+    if (!looksLikeThinkingText(combined)) return null;
+    if (looksLikeNonThinkingUi(title) && !looksLikeThinkingText(fullText)) return null;
+
+    let content = fullText;
+
+    if (summaryText && content.startsWith(summaryText)) {
+      content = content.slice(summaryText.length).trim();
     }
 
-    if (!/(thinking|reasoning|reasoned|thought|analyz|search|reading|browse|tool|思考|推理|分析|搜索|检索|浏览|读取|工具)/i.test(raw)) {
-      return "";
+    if (!content || content.length < 3) {
+      content = fullText || title;
     }
 
-    return raw;
+    return {
+      title: title || "visible thinking",
+      content: content || title || "visible thinking"
+    };
   }
 
   function collectVisibleThinkingModules() {
     const nodes = engineQsAll([
       'main details',
-      'main summary',
-      'main button',
-      'main [role="button"]',
       'main [data-testid*="thinking" i]',
       'main [data-testid*="reasoning" i]',
+      'main [data-testid*="thought" i]',
       'main [class*="thinking" i]',
-      'main [class*="reasoning" i]'
+      'main [class*="reasoning" i]',
+      'main [class*="thought" i]',
+      'main [aria-label*="Thinking" i]',
+      'main [aria-label*="Reasoning" i]',
+      'main [aria-label*="思考" i]',
+      'main [aria-label*="推理" i]'
     ].join(", "));
 
     const seen = new Set();
@@ -1518,17 +1770,15 @@
     nodes.forEach((el) => {
       if (!usableDomNode(el)) return;
 
-      const title = extractThinkingModuleTitle(el);
-      if (!title) return;
+      const block = extractThinkingBlock(el);
+      if (!block) return;
 
-      const key = title.toLowerCase();
+      const key = `${block.title}\n${block.content}`.toLowerCase();
 
       if (seen.has(key)) return;
       seen.add(key);
 
-      modules.push({
-        title
-      });
+      modules.push(block);
     });
 
     return modules.slice(-8);
@@ -1558,17 +1808,23 @@
       })
       .filter((m) => m.content);
 
-    const thinking = currentlyThinking || state.popup.thinking
-      ? engineQsAll('details, [data-testid*="thinking" i], [data-testid*="reasoning" i], [class*="thinking" i], [class*="reasoning" i]')
-          .filter(usableDomNode)
-          .map((el) => txt(el))
-          .filter(Boolean)
-          .slice(-8)
-      : [];
-
-    const thinkingModules = currentlyThinking
+    const thinkingModules = currentlyThinking || state.popup.thinking
       ? collectVisibleThinkingModules()
       : [];
+
+    const thinking = thinkingModules
+      .map((module) => {
+        const title = module.title || "visible thinking";
+        const content = module.content || "";
+
+        if (!content || content === title) {
+          return title;
+        }
+
+        return `${title}\n\n${content}`;
+      })
+      .filter(Boolean)
+      .slice(-8);
 
     const links = [];
     const seen = new Set();
@@ -1645,18 +1901,27 @@
 
     body.textContent = "";
 
-    if (!state.data.thinking.length) {
-      body.innerHTML = `<div class="oracle-v14-empty">NO VISIBLE THINKING BLOCK DETECTED.</div>`;
+    const modules = state.data.thinkingModules && state.data.thinkingModules.length
+      ? state.data.thinkingModules
+      : [];
+
+    if (!modules.length) {
+      body.innerHTML = `<div class="oracle-v14-empty">NO VISIBLE THINKING BLOCK DETECTED. THE PAGE MAY NOT EXPOSE THINKING CONTENT.</div>`;
       return;
     }
 
-    state.data.thinking.forEach((item, idx) => {
+    modules.forEach((module, idx) => {
       const div = document.createElement("div");
-      div.style.marginBottom = "14px";
+      div.style.marginBottom = "16px";
+
+      const title = escapeHtml(module.title || `THINKING SIGNAL ${idx + 1}`);
+      const content = escapeHtml(module.content || "");
+
       div.innerHTML = `
-        <div class="oracle-v14-line-head">#--- THINKING SIGNAL ${idx + 1}</div>
-        <div>${escapeHtml(item)}</div>
+        <div class="oracle-v14-line-head">#--- ${title}</div>
+        <div>${content}</div>
       `;
+
       body.appendChild(div);
     });
   }
@@ -1694,7 +1959,7 @@
       d: draft,
       model: modelLabel,
       thinking: isThinking,
-      thinkingModules: thinkingModules.map((x) => x.title),
+      thinkingModules: thinkingModules.map((x) => [x.title, x.content]),
       focused: inputFocused
     });
   }
@@ -2114,7 +2379,9 @@
   }
 
   function pushCodeBlockLines(lines, codeText, contentW, ctx, codeId) {
-    wrapCodeText(codeText, contentW, ctx).forEach((ln) => {
+    const copyText = String(codeText || "");
+
+    wrapCodeText(copyText, contentW, ctx).forEach((ln) => {
       lines.push({
         text: ln,
         color: COLORS.amberHot,
@@ -2129,7 +2396,7 @@
       head: false,
       kind: "copyButton",
       codeId,
-      codeText
+      codeText: copyText
     });
   }
 
@@ -2140,7 +2407,7 @@
       messages: state.data.messages.map((msg) => [
         msg.role,
         msg.content,
-        (msg.segments || []).map((seg) => [seg.type, seg.text])
+        (msg.segments || []).map((seg) => [seg.type, seg.text, seg.copyText || ""])
       ])
     });
   }
@@ -2203,7 +2470,13 @@
         if (segment.type === "code") {
           codeBlockCounter += 1;
           ctx.font = codeFont;
-          pushCodeBlockLines(lines, segment.text, contentW, ctx, `code-${idx}-${codeBlockCounter}`);
+          pushCodeBlockLines(
+            lines,
+            segment.copyText || segment.text,
+            contentW,
+            ctx,
+            `code-${idx}-${codeBlockCounter}`
+          );
           ctx.font = bodyFont;
           return;
         }
@@ -2325,7 +2598,7 @@
     if (state.data.isThinking) {
       const modules = state.data.thinkingModules && state.data.thinkingModules.length
         ? state.data.thinkingModules
-        : [{ title: "answer generation" }];
+        : [{ title: "answer generation", content: "" }];
 
       modules.forEach((module, moduleIdx) => {
         makeThinkingProgressLines(module.title, moduleIdx + 1, modules.length).forEach((ln, idx) => {
@@ -2433,14 +2706,14 @@
     buildShell();
 
     if (!initWebGL()) {
-      console.error("[oracle-v14-performance] WebGL init failed.");
+      console.error("[oracle-v14-standby-toggle] WebGL init failed.");
       return;
     }
 
     resizeCanvases();
 
     if (getBool(STORE_ON, true)) {
-      enableShell();
+      enableShell(true);
     } else {
       disableShell();
     }
@@ -2496,13 +2769,19 @@
       if (event.altKey && event.shiftKey && event.key.toLowerCase() === "o") {
         const nowOn = document.documentElement.classList.contains(ROOT_CLASS);
 
-        if (nowOn) {
-          setBool(STORE_ON, false);
-          disableShell();
-        } else {
-          setBool(STORE_ON, true);
-          enableShell();
-        }
+        showBootOverlay(2000);
+
+        afterOverlayPaint(() => {
+          if (nowOn) {
+            setBool(STORE_ON, false);
+            disableShell();
+          } else {
+            setBool(STORE_ON, true);
+            enableShell();
+          }
+
+          updateToggleButtonLabel();
+        });
       }
     });
 
@@ -2518,7 +2797,9 @@
       }
     }, 1400);
 
-    console.log("[Oracle CRT v14.7 Performance] loaded. Alt+Shift+O toggles shell.");
+    updateToggleButtonLabel();
+
+    console.log("[Oracle CRT v14.9 Standby Toggle] loaded. Alt+Shift+O toggles shell.");
   }
 
   function waitForBody() {
