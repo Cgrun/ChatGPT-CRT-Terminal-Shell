@@ -1,0 +1,2534 @@
+// ==UserScript==
+// @name         J's Oracle CRT Terminal Shell for ChatGPT v14.7
+// @namespace    js-oracle-crt-chatgpt-v14
+// @version      1.4.7
+// @description  V14.7 WebGL curved CRT terminal shell for ChatGPT. Performance optimized. Fixes input sync, caret rendering, code formatting, transparent copy buttons, visible thinking titles, and send behavior.
+// @author       CrJia
+// @match        https://chatgpt.com/*
+// @match        https://chat.openai.com/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  const ROOT_ID = "oracle-crt-v14-root";
+  const STYLE_ID = "oracle-crt-v14-style";
+  const ROOT_CLASS = "oracle-crt-v14-on";
+  const STORE_ON = "oracleCrtV14Enabled";
+
+  const MAX_MESSAGES = 12;
+
+  const COLORS = {
+    amber: "#e08901",
+    amberHot: "#eda227",
+    amberStrong: "#ffb000",
+    amberDim: "#bf7302",
+    amberDeep: "#694302",
+    red: "#e05a1a",
+    black: "#000000",
+    select: "#ffcf03",
+    selectHot: "#ffd40e",
+    selectGlow: "#ff9a00"
+  };
+
+  let shell = null;
+  let screenCanvas = null;
+  let gl = null;
+  let glProgram = null;
+  let glTex = null;
+  let offscreen = null;
+  let offctx = null;
+  let dpr = Math.max(1, window.devicePixelRatio || 1);
+
+  let syncTimer = null;
+  let renderQueued = false;
+  let resizeTimer = null;
+
+  let movedComposer = null;
+  let composerPlaceholder = null;
+  const boundNativePromptSync = new WeakSet();
+
+  const state = {
+    shellOn: true,
+    autoFollow: true,
+    inputFocused: false,
+    inputCursor: 0,
+    inputSelectionEnd: 0,
+    mainScrollY: 0,
+    totalContentHeight: 0,
+    popup: {
+      sidebar: false,
+      thinking: false,
+      chatbox: false
+    },
+    lastMessagesHash: "",
+    renderCache: {
+      key: "",
+      lines: []
+    },
+    data: {
+      messages: [],
+      thinking: [],
+      thinkingModules: [],
+      draft: "",
+      chatLinks: [],
+      modelLabel: "MODEL",
+      isThinking: false
+    }
+  };
+
+  function getBool(key, fallback) {
+    const value = localStorage.getItem(key);
+    if (value === null) return fallback;
+    return value === "true";
+  }
+
+  function setBool(key, value) {
+    localStorage.setItem(key, value ? "true" : "false");
+  }
+
+  function isMine(node) {
+    return Boolean(node && node.closest && node.closest(`#${ROOT_ID}`));
+  }
+
+  function qsAll(selector, base = document) {
+    try {
+      return Array.from(base.querySelectorAll(selector));
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function engineQsAll(selector) {
+    return qsAll(selector).filter((el) => {
+      if (!el) return false;
+
+      if (isMine(el)) {
+        return Boolean(el.closest(".oracle-v14-native-composer"));
+      }
+
+      return true;
+    });
+  }
+
+  function txt(el) {
+    if (!el) return "";
+
+    if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
+      return (el.value || "").replace(/\u00a0/g, " ").trim();
+    }
+
+    if (el.isContentEditable) {
+      return (el.textContent || "").replace(/\u00a0/g, " ").trim();
+    }
+
+    return (el.textContent || "").replace(/\u00a0/g, " ").trim();
+  }
+
+  function usableDomNode(el) {
+    if (!el || isMine(el)) return false;
+
+    const style = window.getComputedStyle(el);
+    if (style.display === "none") return false;
+
+    const text = txt(el);
+    const rect = el.getBoundingClientRect();
+
+    return text.length > 0 || rect.width > 1 || rect.height > 1;
+  }
+
+  function ignoreShellMutations(mutations) {
+    return mutations.every((mutation) => {
+      if (isMine(mutation.target)) return true;
+
+      const nodes = [
+        ...Array.from(mutation.addedNodes || []),
+        ...Array.from(mutation.removedNodes || [])
+      ];
+
+      return nodes.length > 0 && nodes.every((node) => {
+        return node.nodeType === 1 && isMine(node);
+      });
+    });
+  }
+
+  function bestMessageContent(message) {
+    return (
+      message.querySelector(".markdown") ||
+      message.querySelector('[data-message-author-role] > div') ||
+      message
+    );
+  }
+
+  function injectStyle() {
+    if (document.getElementById(STYLE_ID)) return;
+
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = `
+      :root {
+        --oracle-font:
+          "Glass TTY VT220",
+          "VT323",
+          "Terminus",
+          "Terminess Nerd Font",
+          "Px437 IBM VGA 8x16",
+          "Perfect DOS VGA 437",
+          "Cascadia Mono",
+          "Consolas",
+          "Courier New",
+          monospace;
+
+        --oracle-code-font:
+          "Cascadia Mono",
+          "Consolas",
+          "Courier New",
+          monospace;
+
+        --oracle-amber: ${COLORS.amber};
+        --oracle-amber-hot: ${COLORS.amberHot};
+        --oracle-amber-strong: ${COLORS.amberStrong};
+        --oracle-amber-dim: ${COLORS.amberDim};
+        --oracle-amber-deep: ${COLORS.amberDeep};
+        --oracle-red: ${COLORS.red};
+        --oracle-black: ${COLORS.black};
+        --oracle-select: ${COLORS.select};
+      }
+
+      html.${ROOT_CLASS},
+      html.${ROOT_CLASS} body {
+        background: #000 !important;
+        overflow: hidden !important;
+      }
+
+      html.${ROOT_CLASS} body > *:not(#${ROOT_ID}):not(script):not(style):not(link):not(meta) {
+        opacity: 0 !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
+      }
+
+      html.${ROOT_CLASS} body > :is(
+        [role="dialog"],
+        [role="menu"],
+        [role="listbox"],
+        [aria-modal="true"],
+        [data-radix-popper-content-wrapper]
+      ),
+      html.${ROOT_CLASS} body > *:has([role="dialog"]),
+      html.${ROOT_CLASS} body > *:has([role="menu"]),
+      html.${ROOT_CLASS} body > *:has([role="listbox"]),
+      html.${ROOT_CLASS} body > *:has([data-radix-popper-content-wrapper]) {
+        opacity: 1 !important;
+        visibility: visible !important;
+        pointer-events: auto !important;
+        z-index: 2147483600 !important;
+      }
+
+      #${ROOT_ID},
+      #${ROOT_ID} *:not(pre):not(code):not(kbd):not(samp) {
+        font-family: var(--oracle-font) !important;
+        font-variant-ligatures: none !important;
+        font-feature-settings: "liga" 0, "calt" 0 !important;
+        box-sizing: border-box !important;
+      }
+
+      #${ROOT_ID} pre,
+      #${ROOT_ID} code,
+      #${ROOT_ID} kbd,
+      #${ROOT_ID} samp {
+        font-family: var(--oracle-code-font) !important;
+      }
+
+      #${ROOT_ID} {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483001;
+        background: #000;
+        color: var(--oracle-amber);
+      }
+
+      .oracle-v14-main {
+        position: absolute;
+        inset: 0 0 48px 0;
+        background: #000;
+        cursor: text;
+        overflow: hidden;
+      }
+
+      #oracle-v14-webgl {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        display: block;
+        background: #000;
+        z-index: 5;
+      }
+
+      .oracle-v14-select-layer {
+        position: absolute;
+        inset: 0;
+        z-index: 20;
+        overflow: hidden;
+        background: transparent !important;
+        pointer-events: auto;
+        user-select: text;
+        cursor: text;
+        padding: 14px 18px 0 18px;
+      }
+
+      .oracle-v14-select-content {
+        white-space: pre-wrap;
+        line-height: 24px;
+        font-size: 17px;
+        color: rgba(224, 137, 1, 0.012);
+        text-shadow: none !important;
+        font-family:
+          "Glass TTY VT220",
+          "VT323",
+          "Cascadia Mono",
+          "Consolas",
+          "Courier New",
+          monospace !important;
+        user-select: text;
+        pointer-events: auto;
+      }
+
+      .oracle-v14-select-layer ::selection,
+      .oracle-v14-select-content::selection,
+      .oracle-v14-select-content *::selection,
+      #${ROOT_ID} ::selection,
+      #${ROOT_ID} *::selection,
+      .oracle-v14-native-composer ::selection,
+      .oracle-v14-native-composer *::selection {
+        background: #ffcf03 !important;
+        color: #050200 !important;
+        text-shadow:
+          0 0 1px rgba(255, 255, 210, 1),
+          0 0 5px rgba(255, 207, 3, 0.95),
+          0 0 14px rgba(255, 154, 0, 0.75),
+          0 0 28px rgba(255, 102, 0, 0.38) !important;
+      }
+
+      .oracle-v14-code-copy-overlay {
+        position: absolute;
+        left: 18px;
+        right: 18px;
+        height: 24px;
+        z-index: 35;
+        border: 0 !important;
+        outline: 0 !important;
+        cursor: pointer;
+        background: transparent !important;
+        color: transparent !important;
+        font-family: var(--oracle-font) !important;
+        text-align: center;
+        letter-spacing: 0.08em;
+        box-shadow: none !important;
+        text-shadow: none !important;
+      }
+
+      .oracle-v14-code-copy-overlay:hover {
+        background: transparent !important;
+        color: transparent !important;
+        box-shadow: none !important;
+        filter: none !important;
+      }
+
+      .oracle-v14-inline-input {
+        position: absolute;
+        left: 18px;
+        bottom: 54px;
+        width: 1px;
+        height: 1px;
+        opacity: 0;
+        color: transparent;
+        background: transparent;
+        border: 0;
+        outline: 0;
+        resize: none;
+        overflow: hidden;
+        pointer-events: none;
+        z-index: 1;
+      }
+
+      .oracle-v14-bottom-bar {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        height: 48px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 10px;
+        background: #000;
+        border-top: 0;
+        z-index: 80;
+        pointer-events: auto;
+      }
+
+      .oracle-v14-btn {
+        border: 0 !important;
+        outline: 0 !important;
+        background: #000 !important;
+        color: var(--oracle-amber-hot) !important;
+        padding: 4px 10px;
+        cursor: pointer;
+        white-space: nowrap;
+        text-shadow:
+          0 0 1px rgba(255, 202, 70, 0.95),
+          0 0 5px rgba(224, 137, 1, 0.82),
+          0 0 13px rgba(224, 100, 0, 0.45);
+      }
+
+      .oracle-v14-btn::before {
+        content: "[";
+        color: var(--oracle-amber-dim);
+      }
+
+      .oracle-v14-btn::after {
+        content: "]";
+        color: var(--oracle-amber-dim);
+      }
+
+      .oracle-v14-btn:hover {
+        background: var(--oracle-amber-hot) !important;
+        color: #000 !important;
+        text-shadow: none !important;
+      }
+
+      .oracle-v14-popup {
+        position: absolute;
+        background: #000;
+        color: var(--oracle-amber);
+        z-index: 100;
+        display: none;
+        overflow: hidden;
+        box-shadow:
+          inset 0 0 24px rgba(224,137,1,0.04),
+          inset 0 0 80px rgba(224,80,0,0.02);
+      }
+
+      .oracle-v14-popup.show {
+        display: block;
+      }
+
+      .oracle-v14-popup::before {
+        content: "#--- " attr(data-title) " ------------------------------------------------------------------------------------------------------------------------------------------------";
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: 0;
+        height: 22px;
+        line-height: 22px;
+        overflow: hidden;
+        white-space: nowrap;
+        color: var(--oracle-amber-hot);
+        text-shadow:
+          0 0 1px rgba(255, 218, 104, 1),
+          0 0 8px rgba(237, 162, 39, 0.95),
+          0 0 20px rgba(224, 137, 1, 0.62);
+      }
+
+      .oracle-v14-popup::after {
+        content: "#----------------------------------------------------------------------------------------------------------------------------------------------------------------";
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        height: 20px;
+        line-height: 20px;
+        overflow: hidden;
+        white-space: nowrap;
+        color: var(--oracle-amber-dim);
+      }
+
+      .oracle-v14-popup-body {
+        position: absolute;
+        inset: 24px 12px 22px 12px;
+        overflow: auto;
+        white-space: pre-wrap;
+        line-height: 1.45;
+        color: var(--oracle-amber);
+        scrollbar-width: thin;
+        scrollbar-color: var(--oracle-amber-hot) #000;
+      }
+
+      .oracle-v14-popup-body::-webkit-scrollbar {
+        width: 10px;
+        height: 10px;
+      }
+
+      .oracle-v14-popup-body::-webkit-scrollbar-thumb {
+        background: var(--oracle-amber-hot);
+        border: 2px solid #000;
+      }
+
+      .oracle-v14-popup-body::-webkit-scrollbar-track {
+        background: #000;
+      }
+
+      #oracle-v14-sidebar-popup {
+        left: 28px;
+        top: 28px;
+        width: 360px;
+        height: 65vh;
+      }
+
+      #oracle-v14-thinking-popup {
+        right: 28px;
+        top: 28px;
+        width: 420px;
+        height: 65vh;
+      }
+
+      #oracle-v14-chatbox-popup {
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        width: min(920px, 88vw);
+        height: min(320px, 44vh);
+      }
+
+      .oracle-v14-link-btn {
+        display: block;
+        width: 100%;
+        border: 0 !important;
+        outline: 0 !important;
+        background: #000 !important;
+        color: var(--oracle-amber-hot) !important;
+        text-align: left;
+        padding: 4px 0;
+        cursor: pointer;
+      }
+
+      .oracle-v14-link-btn:hover {
+        background: var(--oracle-amber-hot) !important;
+        color: #000 !important;
+        text-shadow: none !important;
+      }
+
+      .oracle-v14-line-head {
+        color: var(--oracle-amber-hot);
+      }
+
+      .oracle-v14-line-user {
+        color: var(--oracle-red);
+      }
+
+      .oracle-v14-empty {
+        color: var(--oracle-amber-deep);
+      }
+
+      .oracle-v14-native-composer {
+        display: block !important;
+        width: 100% !important;
+        height: 100% !important;
+        max-width: none !important;
+        min-width: 0 !important;
+        margin: 0 !important;
+        background: #000 !important;
+        box-shadow: none !important;
+        border: 0 !important;
+        outline: 0 !important;
+        visibility: visible !important;
+        opacity: 1 !important;
+        pointer-events: auto !important;
+      }
+
+      .oracle-v14-native-composer,
+      .oracle-v14-native-composer *:not(pre):not(code):not(kbd):not(samp) {
+        font-family: var(--oracle-font) !important;
+        color: var(--oracle-amber-hot) !important;
+        text-shadow:
+          0 0 1px rgba(255, 202, 70, 0.95),
+          0 0 5px rgba(224, 137, 1, 0.82),
+          0 0 13px rgba(224, 100, 0, 0.45) !important;
+      }
+
+      .oracle-v14-native-composer * {
+        visibility: visible !important;
+      }
+
+      .oracle-v14-native-composer :where(textarea, input, [contenteditable="true"], #prompt-textarea) {
+        background: #000 !important;
+        color: var(--oracle-amber-hot) !important;
+        caret-color: var(--oracle-amber-hot) !important;
+        border: 0 !important;
+        outline: 0 !important;
+        box-shadow: none !important;
+      }
+
+      .oracle-v14-native-composer :where(button, [role="button"]) {
+        background: #000 !important;
+        color: var(--oracle-amber-hot) !important;
+        border: 0 !important;
+        box-shadow: none !important;
+      }
+
+      .oracle-v14-native-composer :where(button:hover, [role="button"]:hover) {
+        background: var(--oracle-amber-hot) !important;
+        color: #000 !important;
+        text-shadow: none !important;
+      }
+
+      .oracle-v14-native-composer svg,
+      .oracle-v14-native-composer svg * {
+        color: var(--oracle-amber-hot) !important;
+        stroke: currentColor !important;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function buildShell() {
+    if (document.getElementById(ROOT_ID)) return;
+
+    const root = document.createElement("div");
+    root.id = ROOT_ID;
+
+    root.innerHTML = `
+      <div class="oracle-v14-main" title="Click to focus terminal input">
+        <canvas id="oracle-v14-webgl"></canvas>
+        <div id="oracle-v14-select-layer" class="oracle-v14-select-layer">
+          <div id="oracle-v14-select-content" class="oracle-v14-select-content"></div>
+        </div>
+        <textarea id="oracle-v14-inline-input" class="oracle-v14-inline-input" spellcheck="true"></textarea>
+      </div>
+
+      <div id="oracle-v14-sidebar-popup" class="oracle-v14-popup" data-title="SIDEBAR">
+        <div class="oracle-v14-popup-body" id="oracle-v14-sidebar-body"></div>
+      </div>
+
+      <div id="oracle-v14-thinking-popup" class="oracle-v14-popup" data-title="THINKING">
+        <div class="oracle-v14-popup-body" id="oracle-v14-thinking-body"></div>
+      </div>
+
+      <div id="oracle-v14-chatbox-popup" class="oracle-v14-popup" data-title="CHATBOX">
+        <div class="oracle-v14-popup-body" id="oracle-v14-chatbox-body">
+          <div class="oracle-v14-empty">NATIVE CHATGPT COMPOSER WILL BE DOCKED HERE.</div>
+        </div>
+      </div>
+
+      <div class="oracle-v14-bottom-bar">
+        <button class="oracle-v14-btn" data-action="sidebar">SIDEBAR</button>
+        <button class="oracle-v14-btn" data-action="thinking">THINKING</button>
+        <button class="oracle-v14-btn" data-action="toggle-shell">SCRIPT OFF</button>
+        <button class="oracle-v14-btn" data-action="send">SEND</button>
+        <button class="oracle-v14-btn" data-action="add-file">ADD FILE</button>
+        <button class="oracle-v14-btn" data-action="dictate">DICTATE</button>
+        <button class="oracle-v14-btn" data-action="model">MODEL SELECT</button>
+        <button class="oracle-v14-btn" data-action="chatbox">CHATBOX</button>
+      </div>
+    `;
+
+    document.body.appendChild(root);
+    shell = root;
+    screenCanvas = root.querySelector("#oracle-v14-webgl");
+
+    bindBottomButtons();
+    bindInlineInput();
+
+    const main = root.querySelector(".oracle-v14-main");
+    const selectLayer = root.querySelector("#oracle-v14-select-layer");
+
+    const focusTerminal = () => {
+      const selectedText = String(window.getSelection ? window.getSelection().toString() : "").trim();
+      if (selectedText) return;
+      focusInlineInput();
+    };
+
+    main.addEventListener("wheel", onMainWheel, { passive: false });
+    main.addEventListener("click", focusTerminal);
+
+    if (selectLayer) {
+      selectLayer.addEventListener("wheel", onMainWheel, { passive: false });
+      selectLayer.addEventListener("click", focusTerminal);
+    }
+  }
+
+  function getInlineInput() {
+    return document.getElementById("oracle-v14-inline-input");
+  }
+
+  function bindInlineInput() {
+    const input = getInlineInput();
+    if (!input) return;
+
+    input.addEventListener("focus", () => {
+      state.inputFocused = true;
+      syncInlineInputState();
+    });
+
+    input.addEventListener("blur", () => {
+      state.inputFocused = false;
+      syncInlineInputState();
+    });
+
+    input.addEventListener("input", () => {
+      syncInlineInputState();
+    });
+
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        event.stopPropagation();
+        sendCurrentPrompt();
+        return;
+      }
+
+      setTimeout(syncInlineInputState, 0);
+    });
+
+    ["keyup", "click", "mouseup", "select", "compositionend"].forEach((type) => {
+      input.addEventListener(type, () => {
+        setTimeout(syncInlineInputState, 0);
+      });
+    });
+
+    input.addEventListener("paste", () => {
+      setTimeout(syncInlineInputState, 0);
+    });
+  }
+
+  function focusInlineInput(moveCursorToEnd = false) {
+    const input = getInlineInput();
+    if (!input) return false;
+
+    try {
+      input.focus();
+
+      if (moveCursorToEnd) {
+        const end = input.value.length;
+        input.selectionStart = end;
+        input.selectionEnd = end;
+      }
+
+      state.inputFocused = true;
+      syncInlineInputState();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function syncInlineInputState() {
+    const input = getInlineInput();
+    if (!input) return;
+
+    const value = input.value || "";
+    state.data.draft = value;
+
+    const start = typeof input.selectionStart === "number"
+      ? input.selectionStart
+      : value.length;
+
+    const end = typeof input.selectionEnd === "number"
+      ? input.selectionEnd
+      : start;
+
+    state.inputCursor = Math.max(0, Math.min(value.length, start));
+    state.inputSelectionEnd = Math.max(0, Math.min(value.length, end));
+
+    requestRender();
+  }
+
+  function setInlineDraftValue(value, moveCursorToEnd = true) {
+    const input = getInlineInput();
+    if (!input) return false;
+
+    input.value = value || "";
+
+    if (moveCursorToEnd) {
+      const end = input.value.length;
+
+      try {
+        input.selectionStart = end;
+        input.selectionEnd = end;
+      } catch (_) {}
+    }
+
+    syncInlineInputState();
+    return true;
+  }
+
+  function readInlineDraft() {
+    const input = getInlineInput();
+    return input ? (input.value || "") : "";
+  }
+
+  function clearInlineInput() {
+    setInlineDraftValue("", true);
+  }
+
+  function readPromptValue(target) {
+    if (!target) return "";
+
+    if (target.tagName === "TEXTAREA" || target.tagName === "INPUT") {
+      return target.value || "";
+    }
+
+    if (target.isContentEditable) {
+      return (target.innerText || target.textContent || "")
+        .replace(/\u00a0/g, " ")
+        .replace(/\n$/, "");
+    }
+
+    return txt(target);
+  }
+
+  function getDockedNativePrompt() {
+    return document.querySelector(`#${ROOT_ID} .oracle-v14-native-composer #prompt-textarea`)
+      || document.querySelector(`#${ROOT_ID} .oracle-v14-native-composer textarea`)
+      || document.querySelector(`#${ROOT_ID} .oracle-v14-native-composer [contenteditable="true"]`)
+      || null;
+  }
+
+  function syncNativeDraftToInline(moveCursorToEnd = true) {
+    const prompt = getDockedNativePrompt() || findNativePromptOutsideShell();
+    if (!prompt) return false;
+
+    const value = readPromptValue(prompt);
+    return setInlineDraftValue(value, moveCursorToEnd);
+  }
+
+  function bindNativePromptDraftSync(prompt) {
+    if (!prompt || boundNativePromptSync.has(prompt)) return;
+
+    boundNativePromptSync.add(prompt);
+
+    const handler = () => {
+      if (!state.popup.chatbox) return;
+
+      const value = readPromptValue(prompt);
+      setInlineDraftValue(value, true);
+      state.data.draft = value;
+      requestRender();
+    };
+
+    ["input", "change", "keyup", "paste", "cut", "compositionend"].forEach((type) => {
+      prompt.addEventListener(type, () => setTimeout(handler, 0), true);
+    });
+  }
+
+  function bindBottomButtons() {
+    const root = document.getElementById(ROOT_ID);
+    if (!root) return;
+
+    const bind = (action, handler) => {
+      const btn = root.querySelector(`[data-action="${action}"]`);
+      if (!btn) return;
+
+      btn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        handler();
+      });
+    };
+
+    bind("sidebar", () => {
+      state.popup.sidebar = !state.popup.sidebar;
+      updatePopups();
+      refreshSidebarPopup();
+    });
+
+    bind("thinking", () => {
+      state.popup.thinking = !state.popup.thinking;
+      updatePopups();
+      refreshThinkingPopup();
+    });
+
+    bind("chatbox", () => {
+      toggleChatbox();
+    });
+
+    bind("toggle-shell", () => {
+      setBool(STORE_ON, false);
+      disableShell();
+    });
+
+    bind("send", () => {
+      sendCurrentPrompt();
+    });
+
+    bind("add-file", () => {
+      triggerOriginalAddFile();
+    });
+
+    bind("dictate", () => {
+      triggerOriginalDictate();
+    });
+
+    bind("model", () => {
+      triggerOriginalModelSelect();
+    });
+  }
+
+  function toggleChatbox() {
+    const opening = !state.popup.chatbox;
+    const inlineDraft = readInlineDraft();
+    const input = getInlineInput();
+
+    if (opening) {
+      state.popup.chatbox = true;
+      state.inputFocused = false;
+
+      if (input) {
+        try { input.blur(); } catch (_) {}
+      }
+
+      updatePopups();
+
+      setTimeout(() => {
+        const docked = dockNativeComposer(true);
+        const prompt = getDockedNativePrompt() || findNativePromptOutsideShell();
+
+        if (prompt) {
+          bindNativePromptDraftSync(prompt);
+
+          const nativeDraft = readPromptValue(prompt);
+
+          if (inlineDraft || !nativeDraft) {
+            setNativePromptValue(inlineDraft);
+          } else {
+            setInlineDraftValue(nativeDraft, true);
+          }
+        }
+
+        if (docked) {
+          setTimeout(focusNativePrompt, 60);
+        }
+
+        scheduleSync(80);
+        requestRender();
+      }, 60);
+
+      return;
+    }
+
+    syncNativeDraftToInline(true);
+
+    state.popup.chatbox = false;
+    updatePopups();
+    restoreNativeComposer();
+    focusInlineInput(true);
+    scheduleSync(80);
+    requestRender();
+  }
+
+  function updatePopups() {
+    const map = {
+      sidebar: "oracle-v14-sidebar-popup",
+      thinking: "oracle-v14-thinking-popup",
+      chatbox: "oracle-v14-chatbox-popup"
+    };
+
+    Object.entries(map).forEach(([key, id]) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.classList.toggle("show", !!state.popup[key]);
+    });
+  }
+
+  function disableShell() {
+    restoreNativeComposer();
+    document.documentElement.classList.remove(ROOT_CLASS);
+    if (shell) shell.hidden = true;
+  }
+
+  function enableShell() {
+    document.documentElement.classList.add(ROOT_CLASS);
+    if (shell) shell.hidden = false;
+    state.shellOn = true;
+    setBool(STORE_ON, true);
+    scheduleSync(50);
+    requestRender();
+  }
+
+  function findNativePromptOutsideShell() {
+    const docked = getDockedNativePrompt();
+    if (docked) return docked;
+
+    const candidates = engineQsAll('#prompt-textarea, textarea, [contenteditable="true"]')
+      .filter((el) => {
+        if (!el) return false;
+        if (el.id === "oracle-v14-inline-input") return false;
+
+        const style = window.getComputedStyle(el);
+        return style.display !== "none";
+      });
+
+    return candidates.find((el) => el.matches("#prompt-textarea"))
+      || candidates.find((el) => el.isContentEditable)
+      || candidates.find((el) => el.tagName === "TEXTAREA")
+      || null;
+  }
+
+  function findNativeComposerOutsideShell() {
+    const prompt = findNativePromptOutsideShell();
+    if (!prompt) return null;
+
+    return (
+      prompt.closest("form") ||
+      prompt.closest('[data-testid*="composer" i]') ||
+      prompt.closest('[class*="composer" i]') ||
+      prompt.closest('[class*="prompt" i]') ||
+      prompt.parentElement
+    );
+  }
+
+  function setNativePromptValue(value) {
+    const target = findNativePromptOutsideShell();
+    if (!target) return false;
+
+    const nextValue = value || "";
+
+    try {
+      target.focus();
+    } catch (_) {}
+
+    if (target.tagName === "TEXTAREA" || target.tagName === "INPUT") {
+      const proto = target.tagName === "TEXTAREA"
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+
+      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+
+      if (setter) {
+        setter.call(target, nextValue);
+      } else {
+        target.value = nextValue;
+      }
+
+      target.dispatchEvent(new Event("input", { bubbles: true }));
+      target.dispatchEvent(new Event("change", { bubbles: true }));
+      bindNativePromptDraftSync(target);
+      return true;
+    }
+
+    if (target.isContentEditable) {
+      try {
+        const range = document.createRange();
+        range.selectNodeContents(target);
+
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+
+        const ok = document.execCommand("insertText", false, nextValue);
+
+        if (!ok) {
+          target.textContent = nextValue;
+        }
+      } catch (_) {
+        target.textContent = nextValue;
+      }
+
+      target.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: nextValue
+      }));
+
+      target.dispatchEvent(new Event("change", { bubbles: true }));
+      bindNativePromptDraftSync(target);
+      return true;
+    }
+
+    return false;
+  }
+
+  function dockNativeComposer(shouldFocus = false) {
+    const dock = document.getElementById("oracle-v14-chatbox-body");
+    if (!dock) return false;
+
+    let composer = dock.querySelector(".oracle-v14-native-composer");
+    if (!composer) composer = findNativeComposerOutsideShell();
+
+    if (!composer) {
+      dock.innerHTML = `<div class="oracle-v14-empty">NATIVE CHATGPT COMPOSER NOT FOUND. OPEN A CHAT, THEN PRESS CHATBOX AGAIN.</div>`;
+      return false;
+    }
+
+    if (!isMine(composer)) {
+      if (!composerPlaceholder && composer.parentNode) {
+        composerPlaceholder = document.createComment("oracle-v14-composer-placeholder");
+        composer.parentNode.insertBefore(composerPlaceholder, composer);
+      }
+
+      movedComposer = composer;
+      dock.textContent = "";
+      dock.appendChild(composer);
+    }
+
+    composer.classList.add("oracle-v14-native-composer");
+
+    composer.style.setProperty("display", "block", "important");
+    composer.style.setProperty("visibility", "visible", "important");
+    composer.style.setProperty("opacity", "1", "important");
+    composer.style.setProperty("pointer-events", "auto", "important");
+    composer.style.setProperty("width", "100%", "important");
+    composer.style.setProperty("height", "100%", "important");
+    composer.style.setProperty("max-width", "none", "important");
+    composer.style.setProperty("background", "#000000", "important");
+
+    const prompt = getDockedNativePrompt();
+    if (prompt) bindNativePromptDraftSync(prompt);
+
+    if (shouldFocus) {
+      setTimeout(focusNativePrompt, 80);
+    }
+
+    return true;
+  }
+
+  function focusNativePrompt() {
+    const prompt = getDockedNativePrompt() || findNativePromptOutsideShell();
+
+    if (!prompt) return false;
+
+    try {
+      prompt.focus();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function restoreNativeComposer() {
+    const composer = movedComposer || document.querySelector(`#${ROOT_ID} .oracle-v14-native-composer`);
+    if (!composer) return;
+
+    composer.classList.remove("oracle-v14-native-composer");
+
+    if (composerPlaceholder && composerPlaceholder.parentNode) {
+      composerPlaceholder.parentNode.insertBefore(composer, composerPlaceholder);
+    }
+  }
+
+  function isSendCandidate(el) {
+    if (!el) return false;
+    if (el.disabled || el.getAttribute("aria-disabled") === "true") return false;
+
+    const label = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("data-testid") || ""} ${txt(el)}`.toLowerCase();
+
+    if (/stop|cancel|停止|取消/.test(label)) return false;
+
+    return /send|submit|发送|送出|composer-submit/.test(label)
+      || el.getAttribute("type") === "submit";
+  }
+
+  function clickOriginalSend() {
+    const selectors = [
+      '.oracle-v14-native-composer [data-testid="send-button"]',
+      '.oracle-v14-native-composer [data-testid="composer-submit-button"]',
+      '.oracle-v14-native-composer button[data-testid*="send" i]',
+      '.oracle-v14-native-composer button[data-testid*="submit" i]',
+      '.oracle-v14-native-composer button[aria-label*="Send" i]',
+      '.oracle-v14-native-composer button[aria-label*="发送" i]',
+      '.oracle-v14-native-composer button[type="submit"]',
+      '[data-testid="send-button"]',
+      '[data-testid="composer-submit-button"]',
+      'button[data-testid*="send" i]',
+      'button[data-testid*="submit" i]',
+      'button[aria-label*="Send" i]',
+      'button[aria-label*="发送" i]',
+      'button[type="submit"]'
+    ];
+
+    for (const selector of selectors) {
+      const btn = engineQsAll(selector).find(isSendCandidate);
+
+      if (btn) {
+        btn.click();
+        scheduleSync(600);
+        return true;
+      }
+    }
+
+    const prompt = findNativePromptOutsideShell();
+    const form = prompt ? prompt.closest("form") : null;
+
+    if (form) {
+      try {
+        if (typeof form.requestSubmit === "function") {
+          form.requestSubmit();
+        } else {
+          form.dispatchEvent(new SubmitEvent("submit", { bubbles: true, cancelable: true }));
+        }
+
+        scheduleSync(600);
+        return true;
+      } catch (_) {}
+    }
+
+    return false;
+  }
+
+  function retryClickOriginalSend(maxAttempts = 12, delay = 90, onSuccess = null, onFail = null) {
+    let attempts = 0;
+
+    const tick = () => {
+      attempts += 1;
+
+      if (clickOriginalSend()) {
+        if (typeof onSuccess === "function") onSuccess();
+        return;
+      }
+
+      if (attempts < maxAttempts) {
+        setTimeout(tick, delay);
+      } else if (typeof onFail === "function") {
+        onFail();
+      }
+    };
+
+    tick();
+  }
+
+  function sendCurrentPrompt() {
+    const input = getInlineInput();
+    const inlineDraftRaw = input ? (input.value || "") : "";
+    const inlineDraft = inlineDraftRaw.trim();
+
+    if (state.popup.chatbox) {
+      syncNativeDraftToInline(false);
+    }
+
+    if (inlineDraft) {
+      const inserted = setNativePromptValue(inlineDraftRaw);
+
+      if (!inserted) {
+        state.data.draft = `${inlineDraftRaw}\n[ORACLE ERROR: native ChatGPT prompt not found. Open CHATBOX once, then try again.]`;
+        requestRender();
+        return false;
+      }
+
+      retryClickOriginalSend(14, 90, () => {
+        clearInlineInput();
+        state.autoFollow = true;
+        scheduleSync(650);
+      }, () => {
+        state.data.draft = `${inlineDraftRaw}\n[ORACLE ERROR: send button not found or still disabled.]`;
+        requestRender();
+      });
+
+      return true;
+    }
+
+    const sent = clickOriginalSend();
+
+    if (sent) {
+      clearInlineInput();
+      state.autoFollow = true;
+    }
+
+    return sent;
+  }
+
+  function triggerOriginalAddFile() {
+    if (state.popup.chatbox) dockNativeComposer();
+
+    const fileInput = engineQsAll('input[type="file"]').find((el) => !el.disabled);
+
+    if (fileInput) {
+      fileInput.click();
+      return true;
+    }
+
+    const attachBtn = engineQsAll(
+      'button[aria-label*="Attach" i], button[aria-label*="Upload" i], button[aria-label*="Add photos" i], button[aria-label*="Add files" i], button[aria-label*="文件" i], button[aria-label*="附件" i], [role="button"][aria-label*="Attach" i]'
+    ).find(Boolean);
+
+    if (attachBtn) {
+      attachBtn.click();
+      return true;
+    }
+
+    return false;
+  }
+
+  function triggerOriginalDictate() {
+    if (state.popup.chatbox) dockNativeComposer();
+
+    const btn = engineQsAll(
+      'button[aria-label*="Dictate" i], [role="button"][aria-label*="Dictate" i], button[aria-label*="dictation" i], [role="button"][aria-label*="dictation" i], button[aria-label*="语音" i], [role="button"][aria-label*="语音" i]'
+    ).find(Boolean);
+
+    if (btn) {
+      btn.click();
+      return true;
+    }
+
+    return false;
+  }
+
+  function triggerOriginalModelSelect() {
+    const btn = engineQsAll('button[aria-haspopup="menu"], [role="button"][aria-haspopup="menu"], button, [role="button"]').find((el) => {
+      const label = `${el.getAttribute("aria-label") || ""} ${txt(el)}`.toLowerCase();
+      return /model|gpt|o3|o4|4o|5|thinking|instant|选择模型|模型/.test(label);
+    });
+
+    if (btn) {
+      btn.click();
+      return true;
+    }
+
+    return false;
+  }
+
+  function isChatGPTThinking() {
+    const stopBtn = engineQsAll(
+      [
+        '[data-testid="stop-button"]',
+        '[data-testid="composer-stop-button"]',
+        'button[aria-label*="Stop" i]',
+        'button[aria-label*="停止" i]',
+        'button[aria-label*="Cancel" i]',
+        'button[aria-label*="取消" i]'
+      ].join(", ")
+    ).find((el) => {
+      if (!el) return false;
+      if (el.disabled) return false;
+      if (el.getAttribute("aria-disabled") === "true") return false;
+
+      const label = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("data-testid") || ""} ${txt(el)}`.toLowerCase();
+
+      return /stop|cancel|停止|取消/.test(label);
+    });
+
+    if (stopBtn) return true;
+
+    const busyNode = engineQsAll(
+      [
+        '[aria-busy="true"]',
+        '[data-testid*="streaming" i]',
+        '[data-testid*="generating" i]',
+        '[class*="streaming" i]'
+      ].join(", ")
+    ).find((el) => {
+      if (!el) return false;
+      if (isMine(el) && !el.closest(".oracle-v14-native-composer")) return false;
+
+      const label = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("data-testid") || ""} ${el.className || ""}`.toLowerCase();
+
+      if (/history|sidebar|model|selector|menu/.test(label)) return false;
+
+      return true;
+    });
+
+    if (busyNode) return true;
+
+    return false;
+  }
+
+  function forceOpenThinking() {
+    engineQsAll("details").forEach((d) => {
+      const label = txt(d).slice(0, 180);
+
+      if (/(thinking|reasoning|thought for|思考|推理)/i.test(label)) {
+        d.open = true;
+        d.setAttribute("open", "");
+      }
+    });
+
+    engineQsAll('button[aria-expanded="false"], [role="button"][aria-expanded="false"], summary').forEach((el) => {
+      const label = `${txt(el)} ${el.getAttribute("aria-label") || ""}`;
+
+      if (/(thinking|reasoning|thought for|思考|推理)/i.test(label)) {
+        try { el.click(); } catch (_) {}
+      }
+    });
+  }
+
+  function normalizeProseText(str) {
+    return String(str || "")
+      .replace(/\u00a0/g, " ")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n[ \t]+/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
+  function normalizeCodeText(str) {
+    return String(str || "")
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .replace(/\u00a0/g, " ")
+      .replace(/\n+$/g, "");
+  }
+
+  function extractMessageSegments(root) {
+    if (!root) return [];
+
+    const segments = [];
+    let prose = "";
+
+    const blockTags = new Set([
+      "P", "DIV", "LI", "UL", "OL", "SECTION", "ARTICLE",
+      "BLOCKQUOTE", "H1", "H2", "H3", "H4", "H5", "H6",
+      "TABLE", "THEAD", "TBODY", "TR"
+    ]);
+
+    const skipTags = new Set(["SCRIPT", "STYLE", "SVG", "BUTTON"]);
+
+    const ensureNewline = () => {
+      if (prose && !prose.endsWith("\n")) prose += "\n";
+    };
+
+    const flushProse = () => {
+      const clean = normalizeProseText(prose);
+
+      if (clean) {
+        segments.push({
+          type: "text",
+          text: clean
+        });
+      }
+
+      prose = "";
+    };
+
+    const walk = (node) => {
+      if (!node) return;
+
+      if (node.nodeType === Node.TEXT_NODE) {
+        prose += node.nodeValue || "";
+        return;
+      }
+
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+      const el = node;
+      const tag = el.tagName;
+
+      if (skipTags.has(tag)) return;
+
+      if (tag === "PRE") {
+        flushProse();
+
+        const codeNode = el.querySelector("code") || el;
+        const codeText = normalizeCodeText(codeNode.textContent || codeNode.innerText || "");
+
+        if (codeText.trim()) {
+          segments.push({
+            type: "code",
+            text: codeText
+          });
+        }
+
+        return;
+      }
+
+      if (tag === "BR") {
+        prose += "\n";
+        return;
+      }
+
+      const isBlock = blockTags.has(tag);
+
+      if (isBlock) ensureNewline();
+
+      Array.from(el.childNodes || []).forEach(walk);
+
+      if (tag === "LI") prose += "\n";
+      if (isBlock) ensureNewline();
+    };
+
+    walk(root);
+    flushProse();
+
+    if (!segments.length) {
+      const fallback = normalizeProseText(txt(root));
+
+      if (fallback) {
+        segments.push({
+          type: "text",
+          text: fallback
+        });
+      }
+    }
+
+    return segments;
+  }
+
+  function cleanThinkingTitle(raw) {
+    const firstLine = String(raw || "")
+      .replace(/\u00a0/g, " ")
+      .split(/\n+/)
+      .map((x) => x.trim())
+      .find(Boolean) || "";
+
+    return firstLine
+      .replace(/\s+/g, " ")
+      .replace(/^#+\s*/, "")
+      .slice(0, 72)
+      .trim();
+  }
+
+  function extractThinkingModuleTitle(el) {
+    if (!el) return "";
+
+    const summary = el.matches && el.matches("details")
+      ? el.querySelector("summary")
+      : null;
+
+    const aria = el.getAttribute ? el.getAttribute("aria-label") : "";
+    const testid = el.getAttribute ? el.getAttribute("data-testid") : "";
+
+    const raw =
+      cleanThinkingTitle(summary ? txt(summary) : "") ||
+      cleanThinkingTitle(aria) ||
+      cleanThinkingTitle(txt(el)) ||
+      cleanThinkingTitle(testid);
+
+    if (!raw) return "";
+
+    const lower = raw.toLowerCase();
+
+    if (/model|selector|sidebar|history|conversation|menu|gpt|o3|o4|4o|模型|侧边栏|历史/.test(lower)) {
+      return "";
+    }
+
+    if (!/(thinking|reasoning|reasoned|thought|analyz|search|reading|browse|tool|思考|推理|分析|搜索|检索|浏览|读取|工具)/i.test(raw)) {
+      return "";
+    }
+
+    return raw;
+  }
+
+  function collectVisibleThinkingModules() {
+    const nodes = engineQsAll([
+      'main details',
+      'main summary',
+      'main button',
+      'main [role="button"]',
+      'main [data-testid*="thinking" i]',
+      'main [data-testid*="reasoning" i]',
+      'main [class*="thinking" i]',
+      'main [class*="reasoning" i]'
+    ].join(", "));
+
+    const seen = new Set();
+    const modules = [];
+
+    nodes.forEach((el) => {
+      if (!usableDomNode(el)) return;
+
+      const title = extractThinkingModuleTitle(el);
+      if (!title) return;
+
+      const key = title.toLowerCase();
+
+      if (seen.has(key)) return;
+      seen.add(key);
+
+      modules.push({
+        title
+      });
+    });
+
+    return modules.slice(-8);
+  }
+
+  function collectData() {
+    const currentlyThinking = isChatGPTThinking();
+
+    if (currentlyThinking || state.popup.thinking) {
+      forceOpenThinking();
+    }
+
+    const messages = engineQsAll('[data-message-author-role="assistant"], [data-message-author-role="user"]')
+      .filter(usableDomNode)
+      .slice(-MAX_MESSAGES)
+      .map((msg) => {
+        const role = msg.getAttribute("data-message-author-role") || "assistant";
+        const contentNode = bestMessageContent(msg);
+        const segments = extractMessageSegments(contentNode);
+        const content = segments.map((seg) => seg.text).join("\n").trim() || txt(contentNode);
+
+        return {
+          role,
+          content,
+          segments
+        };
+      })
+      .filter((m) => m.content);
+
+    const thinking = currentlyThinking || state.popup.thinking
+      ? engineQsAll('details, [data-testid*="thinking" i], [data-testid*="reasoning" i], [class*="thinking" i], [class*="reasoning" i]')
+          .filter(usableDomNode)
+          .map((el) => txt(el))
+          .filter(Boolean)
+          .slice(-8)
+      : [];
+
+    const thinkingModules = currentlyThinking
+      ? collectVisibleThinkingModules()
+      : [];
+
+    const links = [];
+    const seen = new Set();
+
+    engineQsAll('nav a, aside a, [data-testid="sidebar"] a, a[href^="/c/"], a[href*="/c/"]').forEach((a) => {
+      const label = txt(a);
+      if (!label || label.length < 2) return;
+      if (/skip|privacy|terms/i.test(label)) return;
+
+      const key = `${a.href}|${label}`;
+      if (seen.has(key)) return;
+
+      seen.add(key);
+      links.push({ label, el: a });
+    });
+
+    const inlineDraft = readInlineDraft();
+    const nativePrompt = getDockedNativePrompt() || findNativePromptOutsideShell();
+    const nativeDraft = nativePrompt ? readPromptValue(nativePrompt) : "";
+
+    const draft = state.popup.chatbox
+      ? (nativeDraft || inlineDraft)
+      : (inlineDraft || nativeDraft);
+
+    let modelLabel = "MODEL";
+    const modelBtn = engineQsAll('button, [role="button"]').find((el) => {
+      const label = `${el.getAttribute("aria-label") || ""} ${txt(el)}`;
+      return /gpt|o3|o4|4o|model|模型/.test(label.toLowerCase());
+    });
+
+    if (modelBtn) {
+      modelLabel = txt(modelBtn).slice(0, 28) || "MODEL";
+    }
+
+    state.data = {
+      messages,
+      thinking,
+      thinkingModules,
+      draft,
+      chatLinks: links,
+      modelLabel,
+      isThinking: currentlyThinking
+    };
+  }
+
+  function refreshSidebarPopup() {
+    const body = document.getElementById("oracle-v14-sidebar-body");
+    if (!body) return;
+
+    body.textContent = "";
+
+    if (!state.data.chatLinks.length) {
+      body.innerHTML = `<div class="oracle-v14-empty">NO SIDEBAR ITEMS DETECTED.</div>`;
+      return;
+    }
+
+    state.data.chatLinks.slice(0, 50).forEach(({ label, el }) => {
+      const btn = document.createElement("button");
+      btn.className = "oracle-v14-link-btn";
+      btn.textContent = label;
+      btn.addEventListener("click", () => {
+        el.click();
+        state.popup.sidebar = false;
+        updatePopups();
+        scheduleSync(350);
+      });
+      body.appendChild(btn);
+    });
+  }
+
+  function refreshThinkingPopup() {
+    const body = document.getElementById("oracle-v14-thinking-body");
+    if (!body) return;
+
+    body.textContent = "";
+
+    if (!state.data.thinking.length) {
+      body.innerHTML = `<div class="oracle-v14-empty">NO VISIBLE THINKING BLOCK DETECTED.</div>`;
+      return;
+    }
+
+    state.data.thinking.forEach((item, idx) => {
+      const div = document.createElement("div");
+      div.style.marginBottom = "14px";
+      div.innerHTML = `
+        <div class="oracle-v14-line-head">#--- THINKING SIGNAL ${idx + 1}</div>
+        <div>${escapeHtml(item)}</div>
+      `;
+      body.appendChild(div);
+    });
+  }
+
+  function escapeHtml(str) {
+    return String(str).replace(/[&<>"']/g, (m) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;"
+    }[m]));
+  }
+
+  function onMainWheel(event) {
+    event.preventDefault();
+
+    const viewH = screenCanvas ? screenCanvas.clientHeight : 0;
+    const contentH = state.totalContentHeight || 0;
+    const maxScroll = Math.max(0, contentH - Math.max(0, viewH - 56));
+
+    state.mainScrollY += event.deltaY;
+
+    if (state.mainScrollY < 0) state.mainScrollY = 0;
+    if (state.mainScrollY > maxScroll) state.mainScrollY = maxScroll;
+
+    state.autoFollow = state.mainScrollY >= maxScroll - 8;
+
+    requestRender();
+  }
+
+  function hashMessages(messages, draft, modelLabel, isThinking, inputFocused, thinkingModules = []) {
+    return JSON.stringify({
+      m: messages.map((x) => [x.role, x.content]),
+      d: draft,
+      model: modelLabel,
+      thinking: isThinking,
+      thinkingModules: thinkingModules.map((x) => x.title),
+      focused: inputFocused
+    });
+  }
+
+  function scheduleSync(delay = 160) {
+    clearTimeout(syncTimer);
+
+    syncTimer = setTimeout(() => {
+      if (!document.documentElement.classList.contains(ROOT_CLASS)) return;
+
+      collectData();
+      refreshSidebarPopup();
+      refreshThinkingPopup();
+
+      const nextHash = hashMessages(
+        state.data.messages,
+        state.data.draft,
+        state.data.modelLabel,
+        state.data.isThinking,
+        state.inputFocused,
+        state.data.thinkingModules
+      );
+
+      if (nextHash !== state.lastMessagesHash) {
+        state.lastMessagesHash = nextHash;
+        state.renderCache.key = "";
+        requestRender();
+      }
+    }, delay);
+  }
+
+  function requestRender() {
+    if (renderQueued) return;
+
+    renderQueued = true;
+
+    requestAnimationFrame(() => {
+      renderQueued = false;
+      renderMainTerminal();
+    });
+  }
+
+  function initWebGL() {
+    gl = screenCanvas.getContext("webgl", {
+      antialias: true,
+      alpha: false,
+      preserveDrawingBuffer: false
+    });
+
+    if (!gl) return false;
+
+    const vsSource = `
+      attribute vec2 a_pos;
+      varying vec2 v_uv;
+
+      void main() {
+        v_uv = (a_pos + 1.0) * 0.5;
+        gl_Position = vec4(a_pos, 0.0, 1.0);
+      }
+    `;
+
+    const fsSource = `
+      precision mediump float;
+
+      varying vec2 v_uv;
+      uniform sampler2D u_tex;
+      uniform float u_curve;
+
+      vec2 curve(vec2 uv) {
+        vec2 p = uv * 2.0 - 1.0;
+
+        float x2 = p.x * p.x;
+        float y2 = p.y * p.y;
+
+        p.x *= 1.0 + u_curve * y2;
+        p.y *= 1.0 + u_curve * x2;
+
+        return p * 0.5 + 0.5;
+      }
+
+      void main() {
+        vec2 uv = curve(v_uv);
+
+        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+          gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+          return;
+        }
+
+        vec4 color = texture2D(u_tex, vec2(uv.x, 1.0 - uv.y));
+
+        float d = distance(v_uv, vec2(0.5, 0.5));
+        float vignette = 1.0 - smoothstep(0.55, 0.92, d);
+
+        color.rgb *= (0.86 + vignette * 0.20);
+
+        gl_FragColor = color;
+      }
+    `;
+
+    function compile(type, source) {
+      const sh = gl.createShader(type);
+      gl.shaderSource(sh, source);
+      gl.compileShader(sh);
+
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+        console.error(gl.getShaderInfoLog(sh));
+        return null;
+      }
+
+      return sh;
+    }
+
+    const vs = compile(gl.VERTEX_SHADER, vsSource);
+    const fs = compile(gl.FRAGMENT_SHADER, fsSource);
+
+    if (!vs || !fs) return false;
+
+    const program = gl.createProgram();
+    gl.attachShader(program, vs);
+    gl.attachShader(program, fs);
+    gl.linkProgram(program);
+
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      console.error(gl.getProgramInfoLog(program));
+      return false;
+    }
+
+    glProgram = program;
+    gl.useProgram(program);
+
+    const posBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -1, -1,
+       1, -1,
+      -1,  1,
+      -1,  1,
+       1, -1,
+       1,  1
+    ]), gl.STATIC_DRAW);
+
+    const aPos = gl.getAttribLocation(program, "a_pos");
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    glTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, glTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    return true;
+  }
+
+  function resizeCanvases() {
+    dpr = Math.max(1, window.devicePixelRatio || 1);
+
+    const rect = screenCanvas.getBoundingClientRect();
+    const w = Math.max(1, Math.round(rect.width * dpr));
+    const h = Math.max(1, Math.round(rect.height * dpr));
+
+    if (screenCanvas.width !== w || screenCanvas.height !== h) {
+      screenCanvas.width = w;
+      screenCanvas.height = h;
+    }
+
+    if (!offscreen) {
+      offscreen = document.createElement("canvas");
+      offctx = offscreen.getContext("2d");
+    }
+
+    if (offscreen.width !== w || offscreen.height !== h) {
+      offscreen.width = w;
+      offscreen.height = h;
+    }
+
+    if (gl) {
+      gl.viewport(0, 0, w, h);
+    }
+
+    state.renderCache.key = "";
+    requestRender();
+  }
+
+  function wrapText(text, maxWidth, ctx) {
+    if (!text) return [""];
+
+    const paragraphs = String(text).split(/\n+/);
+    const out = [];
+
+    for (const para of paragraphs) {
+      if (!para.trim()) {
+        out.push("");
+        continue;
+      }
+
+      const words = para.split(/\s+/);
+      let line = "";
+
+      for (const word of words) {
+        const test = line ? `${line} ${word}` : word;
+
+        if (ctx.measureText(test).width <= maxWidth) {
+          line = test;
+        } else {
+          if (line) out.push(line);
+
+          if (ctx.measureText(word).width <= maxWidth) {
+            line = word;
+          } else {
+            let chunk = "";
+
+            for (const ch of word) {
+              const t = chunk + ch;
+
+              if (ctx.measureText(t).width <= maxWidth) {
+                chunk = t;
+              } else {
+                if (chunk) out.push(chunk);
+                chunk = ch;
+              }
+            }
+
+            line = chunk;
+          }
+        }
+      }
+
+      if (line) out.push(line);
+    }
+
+    return out.length ? out : [""];
+  }
+
+  function wrapPreservedLine(rawLine, maxWidth, ctx) {
+    const lineText = String(rawLine || "").replace(/\t/g, "    ");
+
+    if (!lineText) return [""];
+
+    const out = [];
+    let line = "";
+
+    for (const ch of lineText) {
+      const test = line + ch;
+
+      if (!line || ctx.measureText(test).width <= maxWidth) {
+        line = test;
+      } else {
+        out.push(line);
+        line = ch;
+      }
+    }
+
+    if (line || !out.length) out.push(line);
+
+    return out;
+  }
+
+  function wrapCodeText(text, maxWidth, ctx) {
+    const normalized = String(text || "")
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n");
+
+    const out = [];
+
+    normalized.split("\n").forEach((line) => {
+      wrapPreservedLine(line, maxWidth, ctx).forEach((wrapped) => out.push(wrapped));
+    });
+
+    return out.length ? out : [""];
+  }
+
+  function drawGlowText(ctx, text, x, y, color, font) {
+    ctx.font = font;
+    ctx.fillStyle = color;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 10 * dpr;
+    ctx.fillText(text, x, y);
+    ctx.shadowBlur = 0;
+  }
+
+  function drawRetroCenteredText(ctx, text, centerX, centerY, font, color) {
+    ctx.save();
+    ctx.font = font;
+    ctx.fillStyle = color;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.shadowColor = COLORS.selectGlow;
+    ctx.shadowBlur = 7 * dpr;
+    ctx.fillText(text, centerX, centerY);
+    ctx.restore();
+  }
+
+  function drawCopyButtonLine(ctx, text, x, y, width, height, font) {
+    ctx.save();
+
+    ctx.shadowColor = COLORS.selectGlow;
+    ctx.shadowBlur = 18 * dpr;
+    ctx.fillStyle = COLORS.select;
+    ctx.fillRect(x, y + 2 * dpr, width, Math.max(1, height - 4 * dpr));
+
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = COLORS.selectHot;
+    ctx.lineWidth = 1 * dpr;
+    ctx.strokeRect(
+      x + 0.5 * dpr,
+      y + 2.5 * dpr,
+      width - 1 * dpr,
+      Math.max(1, height - 5 * dpr)
+    );
+
+    ctx.restore();
+
+    drawRetroCenteredText(
+      ctx,
+      text,
+      x + width / 2,
+      y + height / 2,
+      font,
+      "#050200"
+    );
+  }
+
+  function copyTextToClipboard(text) {
+    const value = String(text || "");
+
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      return navigator.clipboard.writeText(value).catch(() => fallbackCopyText(value));
+    }
+
+    return fallbackCopyText(value);
+  }
+
+  function fallbackCopyText(text) {
+    return new Promise((resolve, reject) => {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      ta.style.top = "0";
+      ta.setAttribute("readonly", "readonly");
+
+      document.body.appendChild(ta);
+      ta.select();
+
+      try {
+        const ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+
+        if (ok) resolve();
+        else reject(new Error("copy command failed"));
+      } catch (err) {
+        document.body.removeChild(ta);
+        reject(err);
+      }
+    });
+  }
+
+  function makeThinkingProgressLines(title = "answer generation", moduleIndex = 1, moduleTotal = 1) {
+    const t = performance.now() * 0.001;
+
+    const pct = Math.floor((t * 20 + moduleIndex * 9) % 101);
+    const barWidth = 44;
+    const fill = Math.floor((pct / 100) * barWidth);
+
+    let bar = "";
+
+    for (let i = 0; i < barWidth; i += 1) {
+      if (i < fill) {
+        bar += "-";
+      } else if (i === fill && pct < 100) {
+        bar += ">";
+      } else {
+        bar += " ";
+      }
+    }
+
+    const size = (18 + ((t * 13 + moduleIndex * 7) % 64)).toFixed(1).padStart(5, " ");
+    const speed = Math.floor(320 + ((Math.sin(t * 2.4 + moduleIndex) + 1) * 420));
+    const sec = String(Math.floor(t % 60)).padStart(2, "0");
+
+    const safeTitle = String(title || "thinking")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 72);
+
+    const phase = Math.floor(t * 2 + moduleIndex) % 4;
+    const hooks = [
+      "(1/1) reading visible reasoning module",
+      "(1/1) syncing page thinking title",
+      "(1/1) checking visible stream state",
+      "(1/1) rendering CRT progress signal"
+    ];
+
+    return [
+      `:: ${safeTitle}`,
+      `:: visible thinking module ${moduleIndex}/${moduleTotal}`,
+      `oracle-thinking.pkg.tar.zst   ${size} KiB  ${speed} KiB/s 00:${sec} [${bar}] ${String(pct).padStart(3, " ")}%`,
+      hooks[phase]
+    ];
+  }
+
+  function pushWrappedPromptLines(lines, prefix, draft, cursor, contentW, ctx) {
+    const safeDraft = String(draft || "");
+    const cursorIndex = Math.max(0, Math.min(safeDraft.length, state.inputCursor ?? safeDraft.length));
+    const full = `${prefix}${safeDraft.slice(0, cursorIndex)}${cursor}${safeDraft.slice(cursorIndex)}`;
+    const wrapped = wrapCodeText(full, contentW, ctx);
+
+    wrapped.forEach((ln, idx) => {
+      lines.push({
+        text: ln,
+        color: COLORS.amberHot,
+        head: idx === 0
+      });
+    });
+  }
+
+  function pushCodeBlockLines(lines, codeText, contentW, ctx, codeId) {
+    wrapCodeText(codeText, contentW, ctx).forEach((ln) => {
+      lines.push({
+        text: ln,
+        color: COLORS.amberHot,
+        head: false,
+        code: true
+      });
+    });
+
+    lines.push({
+      text: "COPY CODE",
+      color: COLORS.select,
+      head: false,
+      kind: "copyButton",
+      codeId,
+      codeText
+    });
+  }
+
+  function getStaticLinesCacheKey(contentW) {
+    return JSON.stringify({
+      width: Math.round(contentW),
+      dpr: Math.round(dpr * 100),
+      messages: state.data.messages.map((msg) => [
+        msg.role,
+        msg.content,
+        (msg.segments || []).map((seg) => [seg.type, seg.text])
+      ])
+    });
+  }
+
+  function buildStaticMessageLines(contentW, bodyFont, codeFont, ctx) {
+    const key = getStaticLinesCacheKey(contentW);
+
+    if (state.renderCache.key === key && state.renderCache.lines.length) {
+      return state.renderCache.lines.slice();
+    }
+
+    const lines = [];
+
+    if (!state.data.messages.length) {
+      lines.push({
+        text: "oracle@chatgpt ~]$ waiting for answer signal...",
+        color: COLORS.amberDeep,
+        head: false
+      });
+
+      lines.push({
+        text: "oracle@chatgpt ~]$ click screen to focus terminal input",
+        color: COLORS.amberDeep,
+        head: false
+      });
+
+      lines.push({
+        text: "oracle@chatgpt ~]$ press [CHATBOX] only when you need native composer / upload UI",
+        color: COLORS.amberDeep,
+        head: false
+      });
+
+      lines.push({
+        text: "",
+        color: COLORS.amberDeep,
+        head: false
+      });
+    }
+
+    let codeBlockCounter = 0;
+
+    state.data.messages.forEach((msg, idx) => {
+      const head = msg.role === "user"
+        ? "user@oracle ~]$"
+        : `oracle[${idx + 1}]>`;
+
+      lines.push({
+        text: head,
+        color: msg.role === "user" ? COLORS.red : COLORS.amberHot,
+        head: true
+      });
+
+      const segments = msg.segments && msg.segments.length
+        ? msg.segments
+        : [{ type: "text", text: msg.content || "" }];
+
+      segments.forEach((segment) => {
+        if (!segment || !segment.text) return;
+
+        if (segment.type === "code") {
+          codeBlockCounter += 1;
+          ctx.font = codeFont;
+          pushCodeBlockLines(lines, segment.text, contentW, ctx, `code-${idx}-${codeBlockCounter}`);
+          ctx.font = bodyFont;
+          return;
+        }
+
+        ctx.font = bodyFont;
+
+        const wrapped = wrapText(segment.text, contentW, ctx);
+
+        wrapped.forEach((ln) => {
+          lines.push({
+            text: ln,
+            color: COLORS.amber,
+            head: false
+          });
+        });
+      });
+
+      lines.push({
+        text: "",
+        color: COLORS.amber,
+        head: false
+      });
+    });
+
+    state.renderCache.key = key;
+    state.renderCache.lines = lines.slice();
+
+    return lines;
+  }
+
+  function updateSelectableLayer(lines, lineHeight, padTop, scrollY, blankScrollHeight) {
+    const layer = document.getElementById("oracle-v14-select-layer");
+    const content = document.getElementById("oracle-v14-select-content");
+
+    if (!layer || !content) return;
+
+    layer.querySelectorAll(".oracle-v14-code-copy-overlay").forEach((btn) => btn.remove());
+
+    layer.style.paddingTop = `${Math.round(padTop / dpr)}px`;
+    layer.style.paddingLeft = "18px";
+    layer.style.paddingRight = "18px";
+
+    content.style.lineHeight = `${Math.round(lineHeight / dpr)}px`;
+    content.style.fontSize = "17px";
+    content.style.transform = `translateY(${-Math.round(scrollY / dpr)}px)`;
+
+    const text = lines.map((line) => line.text || "").join("\n");
+
+    content.textContent = text;
+
+    const spacer = document.createElement("div");
+    spacer.style.height = `${Math.max(0, Math.round(blankScrollHeight / dpr))}px`;
+    spacer.textContent = " ";
+    content.appendChild(spacer);
+
+    const visibleH = layer.clientHeight || 0;
+    const cssLineHeight = Math.max(18, Math.round(lineHeight / dpr));
+
+    lines.forEach((line, idx) => {
+      if (!line || line.kind !== "copyButton") return;
+
+      const top = Math.round((padTop + idx * lineHeight - scrollY) / dpr);
+
+      if (top + cssLineHeight < 0 || top > visibleH) return;
+
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "oracle-v14-code-copy-overlay";
+      btn.textContent = "COPY CODE";
+      btn.style.top = `${top}px`;
+      btn.style.height = `${cssLineHeight}px`;
+      btn.title = "Copy this code block";
+
+      btn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+
+        copyTextToClipboard(line.codeText).then(() => {
+          btn.title = "Copied";
+        }).catch(() => {
+          btn.title = "Copy failed";
+        });
+      });
+
+      layer.appendChild(btn);
+    });
+  }
+
+  function renderMainTerminal() {
+    if (!offctx || !gl || !glProgram || !screenCanvas) return;
+
+    const w = offscreen.width;
+    const h = offscreen.height;
+
+    offctx.save();
+    offctx.clearRect(0, 0, w, h);
+    offctx.fillStyle = "#000000";
+    offctx.fillRect(0, 0, w, h);
+
+    const padX = 18 * dpr;
+    const padTop = 14 * dpr;
+    const padBottom = 12 * dpr;
+    const contentW = w - padX * 2;
+    const contentH = h - padTop - padBottom;
+
+    const fontSize = 17 * dpr;
+    const lineHeight = 24 * dpr;
+
+    const headFont = `${fontSize}px "Glass TTY VT220", "VT323", "Cascadia Mono", monospace`;
+    const bodyFont = `${fontSize}px "Glass TTY VT220", "VT323", "Cascadia Mono", monospace`;
+    const codeFont = `${fontSize}px "Cascadia Mono", "Consolas", "Courier New", monospace`;
+    const copyButtonFont = `${fontSize}px "Glass TTY VT220", "VT323", "Cascadia Mono", monospace`;
+
+    offctx.textBaseline = "top";
+    offctx.font = bodyFont;
+
+    const lines = buildStaticMessageLines(contentW, bodyFont, codeFont, offctx);
+
+    if (state.data.isThinking) {
+      const modules = state.data.thinkingModules && state.data.thinkingModules.length
+        ? state.data.thinkingModules
+        : [{ title: "answer generation" }];
+
+      modules.forEach((module, moduleIdx) => {
+        makeThinkingProgressLines(module.title, moduleIdx + 1, modules.length).forEach((ln, idx) => {
+          lines.push({
+            text: ln,
+            color: idx < 2 ? COLORS.amberDim : COLORS.amberHot,
+            head: idx === 2
+          });
+        });
+
+        lines.push({
+          text: "",
+          color: COLORS.amber,
+          head: false
+        });
+      });
+    }
+
+    const draft = state.data.draft || "";
+    const cursorVisible = state.inputFocused && Math.floor(performance.now() / 530) % 2 === 0;
+    const cursor = state.inputFocused ? (cursorVisible ? "█" : " ") : "";
+
+    offctx.font = bodyFont;
+
+    pushWrappedPromptLines(
+      lines,
+      "user@oracle ~]$ ",
+      draft,
+      cursor,
+      contentW,
+      offctx
+    );
+
+    const blankScrollHeight = Math.max(0, contentH - lineHeight);
+
+    const textHeight = lines.length * lineHeight + 8 * dpr;
+    const totalHeight = Math.max(contentH, textHeight + blankScrollHeight);
+
+    state.totalContentHeight = totalHeight;
+
+    const maxScroll = Math.max(0, totalHeight - contentH);
+
+    if (state.autoFollow) {
+      state.mainScrollY = maxScroll;
+    } else {
+      if (state.mainScrollY > maxScroll) state.mainScrollY = maxScroll;
+      if (state.mainScrollY < 0) state.mainScrollY = 0;
+    }
+
+    updateSelectableLayer(lines, lineHeight, padTop, state.mainScrollY, blankScrollHeight);
+
+    let y = padTop - state.mainScrollY;
+
+    for (const line of lines) {
+      if (y > -lineHeight && y < contentH + padTop) {
+        if (line.kind === "copyButton") {
+          drawCopyButtonLine(
+            offctx,
+            line.text,
+            padX,
+            y,
+            contentW,
+            lineHeight,
+            copyButtonFont
+          );
+        } else {
+          drawGlowText(
+            offctx,
+            line.text,
+            padX,
+            y,
+            line.color,
+            line.code ? codeFont : (line.head ? headFont : bodyFont)
+          );
+        }
+      }
+
+      y += lineHeight;
+    }
+
+    offctx.restore();
+
+    gl.useProgram(glProgram);
+    gl.bindTexture(gl.TEXTURE_2D, glTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, offscreen);
+
+    const curveLoc = gl.getUniformLocation(glProgram, "u_curve");
+    gl.uniform1f(curveLoc, 0.11);
+
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    if (
+      (state.data.isThinking || state.inputFocused) &&
+      document.documentElement.classList.contains(ROOT_CLASS)
+    ) {
+      const delay = state.data.isThinking ? 140 : 520;
+      setTimeout(requestRender, delay);
+    }
+  }
+
+  function init() {
+    injectStyle();
+    buildShell();
+
+    if (!initWebGL()) {
+      console.error("[oracle-v14-performance] WebGL init failed.");
+      return;
+    }
+
+    resizeCanvases();
+
+    if (getBool(STORE_ON, true)) {
+      enableShell();
+    } else {
+      disableShell();
+    }
+
+    const observer = new MutationObserver((mutations) => {
+      if (ignoreShellMutations(mutations)) return;
+      scheduleSync(state.data.isThinking ? 120 : 420);
+    });
+
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: [
+        "data-message-author-role",
+        "aria-label",
+        "aria-expanded",
+        "open",
+        "data-testid"
+      ]
+    });
+
+    window.addEventListener("resize", () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        resizeCanvases();
+        scheduleSync(80);
+      }, 100);
+    });
+
+    window.addEventListener("focus", () => {
+      scheduleSync(160);
+      requestRender();
+    });
+
+    document.addEventListener("keydown", (event) => {
+      const input = getInlineInput();
+
+      if (
+        input &&
+        document.activeElement === input &&
+        event.key === "Enter" &&
+        !event.shiftKey &&
+        !event.isComposing &&
+        !event.defaultPrevented
+      ) {
+        event.preventDefault();
+        event.stopPropagation();
+        sendCurrentPrompt();
+        return;
+      }
+
+      if (event.altKey && event.shiftKey && event.key.toLowerCase() === "o") {
+        const nowOn = document.documentElement.classList.contains(ROOT_CLASS);
+
+        if (nowOn) {
+          setBool(STORE_ON, false);
+          disableShell();
+        } else {
+          setBool(STORE_ON, true);
+          enableShell();
+        }
+      }
+    });
+
+    setInterval(() => {
+      if (!document.documentElement.classList.contains(ROOT_CLASS)) return;
+
+      if (!state.inputFocused) {
+        scheduleSync(state.data.isThinking ? 180 : 900);
+      }
+
+      if (state.popup.chatbox) {
+        dockNativeComposer(false);
+      }
+    }, 1400);
+
+    console.log("[Oracle CRT v14.7 Performance] loaded. Alt+Shift+O toggles shell.");
+  }
+
+  function waitForBody() {
+    if (document.body) {
+      init();
+      return;
+    }
+
+    setTimeout(waitForBody, 100);
+  }
+
+  waitForBody();
+})();
