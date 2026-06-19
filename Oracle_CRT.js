@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         J's Oracle CRT Terminal Shell for ChatGPT v14.7
+// @name         J's Oracle CRT Terminal Shell for ChatGPT v15 optimized
 // @namespace    js-oracle-crt-chatgpt-v14
-// @version      1.4.7
-// @description  V14.7 WebGL curved CRT terminal shell for ChatGPT. Performance optimized. Fixes input sync, caret rendering, code formatting, transparent copy buttons, visible thinking titles, and send behavior.
+// @version      1.4.9
+// @description  A retro WebGL CRT terminal interface for ChatGPT with curved-screen rendering, inline terminal input, popup composer, visible thinking-status display, preserved code formatting, glowing copy-code controls, and persistent SCRIPT ON/OFF standby toggle.
 // @author       CrJia
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -16,6 +16,7 @@
   const ROOT_ID = "oracle-crt-v14-root";
   const STYLE_ID = "oracle-crt-v14-style";
   const ROOT_CLASS = "oracle-crt-v14-on";
+  const STANDBY_CLASS = "oracle-v14-standby";
   const STORE_ON = "oracleCrtV14Enabled";
 
   const MAX_MESSAGES = 12;
@@ -33,11 +34,85 @@
     selectGlow: "#ff9a00"
   };
 
+  const MODEL_CLICKABLE_SELECTOR = [
+    "button",
+    '[role="menuitem"]',
+    '[role="menuitemradio"]',
+    '[role="option"]',
+    '[role="radio"]',
+    '[role="tab"]',
+    '[data-testid]',
+    '[cmdk-item]',
+    '[data-cmdk-item]',
+    '[tabindex]'
+  ].join(", ");
+
+  const MODEL_TEXT_SELECTOR = [
+    "button",
+    '[role="menuitem"]',
+    '[role="menuitemradio"]',
+    '[role="option"]',
+    '[role="radio"]',
+    '[role="tab"]',
+    "span",
+    "div",
+    "p"
+  ].join(", ");
+
+  const MODEL_CHILD_OPTION_SELECTOR = [
+    "button",
+    '[role="menuitem"]',
+    '[role="menuitemradio"]',
+    '[role="option"]',
+    '[role="radio"]',
+    '[role="tab"]',
+    "span",
+    "div"
+  ].join(", ");
+
+  const MODEL_OPTION_CANDIDATE_SELECTOR = [
+    MODEL_CLICKABLE_SELECTOR,
+    "div",
+    "span"
+  ].join(", ");
+
+  const MODEL_MENU_SELECTOR = [
+    '[role="menu"]',
+    '[role="listbox"]',
+    '[data-radix-popper-content-wrapper]',
+    '[cmdk-list]',
+    '[data-cmdk-list]',
+    '[data-testid*="model" i]',
+    '[class*="model" i]'
+  ].join(", ");
+
+  const SIDEBAR_LINK_SELECTOR = [
+    "nav a",
+    "aside a",
+    '[data-testid="sidebar"] a',
+    'a[href^="/c/"]',
+    'a[href*="/c/"]'
+  ].join(", ");
+
+  const SIDEBAR_CONTAINER_SELECTOR = [
+    "aside",
+    "nav",
+    '[data-testid="sidebar"]',
+    '[data-testid*="sidebar" i]',
+    '[id*="sidebar" i]',
+    '[class*="sidebar" i]',
+    '[id*="history" i]',
+    '[class*="history" i]'
+  ].join(", ");
+
+  const CHAT_LINK_SELECTOR = 'a[href^="/c/"], a[href*="/c/"]';
+
   let shell = null;
   let screenCanvas = null;
   let gl = null;
   let glProgram = null;
   let glTex = null;
+  let glUniforms = {};
   let offscreen = null;
   let offctx = null;
   let dpr = Math.max(1, window.devicePixelRatio || 1);
@@ -45,6 +120,8 @@
   let syncTimer = null;
   let renderQueued = false;
   let resizeTimer = null;
+  let sidebarLoadTimer = null;
+  let sidebarAutoLoadBusy = false;
 
   let movedComposer = null;
   let composerPlaceholder = null;
@@ -61,7 +138,8 @@
     popup: {
       sidebar: false,
       thinking: false,
-      chatbox: false
+      chatbox: false,
+      model: false
     },
     lastMessagesHash: "",
     renderCache: {
@@ -75,6 +153,7 @@
       draft: "",
       chatLinks: [],
       modelLabel: "MODEL",
+      modelOptions: [],
       isThinking: false
     }
   };
@@ -249,6 +328,75 @@
         color: var(--oracle-amber);
       }
 
+      #${ROOT_ID}.${STANDBY_CLASS} {
+        background: transparent !important;
+        pointer-events: none !important;
+      }
+
+      #${ROOT_ID}.${STANDBY_CLASS} .oracle-v14-main,
+      #${ROOT_ID}.${STANDBY_CLASS} .oracle-v14-popup {
+        display: none !important;
+      }
+
+      #${ROOT_ID}.${STANDBY_CLASS} .oracle-v14-bottom-bar {
+        pointer-events: auto !important;
+        background: transparent !important;
+      }
+
+      #${ROOT_ID}.${STANDBY_CLASS} .oracle-v14-bottom-bar .oracle-v14-btn:not([data-action="toggle-shell"]) {
+        visibility: hidden !important;
+        pointer-events: none !important;
+      }
+
+      #${ROOT_ID}.${STANDBY_CLASS} .oracle-v14-bottom-bar .oracle-v14-btn[data-action="toggle-shell"] {
+        visibility: visible !important;
+        pointer-events: auto !important;
+      }
+
+      #${ROOT_ID}.oracle-v14-booting {
+        pointer-events: auto !important;
+      }
+
+      .oracle-v14-boot-overlay {
+        position: absolute;
+        inset: 0;
+        z-index: 2147483647;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0, 0, 0, 1);
+        pointer-events: auto;
+        opacity: 0;
+        /* 先渐入，再渐出 */
+        transition:
+          opacity 360ms ease-out,
+          background 360ms ease-out;
+      }
+
+      .oracle-v14-boot-overlay.show {
+        opacity: 1;
+      }
+
+      .oracle-v14-boot-overlay.hide {
+        opacity: 0;
+      }
+
+      .oracle-v14-boot-logo {
+        white-space: pre;
+        color: var(--oracle-select);
+        font-family: var(--oracle-font) !important;
+        font-size: clamp(11px, 1.45vw, 20px);
+        line-height: 1.05;
+        letter-spacing: 0.03em;
+        text-align: left;
+        transform: translateY(-48px);
+        text-shadow:
+           0 0 1px rgba(255, 255, 210, 1),
+           0 0 5px rgba(255, 207, 3, 0.95),
+           0 0 14px rgba(255, 154, 0, 0.85),
+           0 0 32px rgba(255, 102, 0, 0.55),
+           0 0 58px rgba(255, 80, 0, 0.35);
+      }
       .oracle-v14-main {
         position: absolute;
         inset: 0 0 48px 0;
@@ -493,6 +641,48 @@
         height: min(320px, 44vh);
       }
 
+      #oracle-v14-model-popup {
+        left: 50%;
+        bottom: 54px;
+        transform: translateX(-50%);
+        width: min(560px, 86vw);
+        height: min(420px, 48vh);
+        top: auto;
+      }
+
+      .oracle-v14-model-option {
+        display: block;
+        width: 100%;
+        border: 0 !important;
+        outline: 0 !important;
+        background: #000 !important;
+        color: var(--oracle-amber-hot) !important;
+        text-align: left;
+        padding: 7px 0;
+        cursor: pointer;
+        white-space: pre-wrap;
+        text-shadow:
+          0 0 1px rgba(255, 202, 70, 0.95),
+          0 0 5px rgba(224, 137, 1, 0.82),
+          0 0 13px rgba(224, 100, 0, 0.45);
+      }
+
+      .oracle-v14-model-option:hover {
+        background: var(--oracle-amber-hot) !important;
+        color: #000 !important;
+        text-shadow: none !important;
+      }
+
+      .oracle-v14-model-option.current::before {
+        content: "> ";
+        color: var(--oracle-select);
+      }
+
+      .oracle-v14-model-status {
+        color: var(--oracle-amber-dim);
+        margin-bottom: 10px;
+      }
+
       .oracle-v14-link-btn {
         display: block;
         width: 100%;
@@ -613,6 +803,12 @@
         </div>
       </div>
 
+      <div id="oracle-v14-model-popup" class="oracle-v14-popup oracle-v14-model-popup" data-title="MODEL SELECT">
+        <div class="oracle-v14-popup-body" id="oracle-v14-model-body">
+          <div class="oracle-v14-empty">PRESS MODEL SELECT TO READ REAL CHATGPT MODEL MENU.</div>
+        </div>
+      </div>
+
       <div class="oracle-v14-bottom-bar">
         <button class="oracle-v14-btn" data-action="sidebar">SIDEBAR</button>
         <button class="oracle-v14-btn" data-action="thinking">THINKING</button>
@@ -631,6 +827,11 @@
 
     bindBottomButtons();
     bindInlineInput();
+
+    const sidebarBody = root.querySelector("#oracle-v14-sidebar-body");
+    if (sidebarBody) {
+      sidebarBody.addEventListener("scroll", onSidebarPopupScroll, { passive: true });
+    }
 
     const main = root.querySelector(".oracle-v14-main");
     const selectLayer = root.querySelector("#oracle-v14-select-layer");
@@ -833,12 +1034,17 @@
       state.popup.sidebar = !state.popup.sidebar;
       updatePopups();
       refreshSidebarPopup();
+
+      if (state.popup.sidebar) {
+        requestSidebarHistoryLoad(180);
+      }
     });
 
     bind("thinking", () => {
       state.popup.thinking = !state.popup.thinking;
       updatePopups();
       refreshThinkingPopup();
+      scheduleSync(40);
     });
 
     bind("chatbox", () => {
@@ -846,8 +1052,21 @@
     });
 
     bind("toggle-shell", () => {
-      setBool(STORE_ON, false);
-      disableShell();
+      const nowOn = document.documentElement.classList.contains(ROOT_CLASS);
+
+      showBootOverlay(2000);
+
+      afterOverlayPaint(() => {
+        if (nowOn) {
+          setBool(STORE_ON, false);
+          disableShell();
+        } else {
+          setBool(STORE_ON, true);
+          enableShell();
+        }
+
+        updateToggleButtonLabel();
+      });
     });
 
     bind("send", () => {
@@ -863,7 +1082,7 @@
     });
 
     bind("model", () => {
-      triggerOriginalModelSelect();
+      toggleModelPopup();
     });
   }
 
@@ -923,7 +1142,8 @@
     const map = {
       sidebar: "oracle-v14-sidebar-popup",
       thinking: "oracle-v14-thinking-popup",
-      chatbox: "oracle-v14-chatbox-popup"
+      chatbox: "oracle-v14-chatbox-popup",
+      model: "oracle-v14-model-popup"
     };
 
     Object.entries(map).forEach(([key, id]) => {
@@ -933,17 +1153,106 @@
     });
   }
 
+  function updateToggleButtonLabel() {
+    const root = document.getElementById(ROOT_ID);
+    if (!root) return;
+
+    const btn = root.querySelector('[data-action="toggle-shell"]');
+    if (!btn) return;
+
+    const isOn = document.documentElement.classList.contains(ROOT_CLASS);
+    btn.textContent = isOn ? "SCRIPT OFF" : "SCRIPT ON";
+  }
+
+  function showBootOverlay(duration = 2000) {
+    const root = document.getElementById(ROOT_ID);
+    if (!root) return null;
+
+    const old = root.querySelector(".oracle-v14-boot-overlay");
+    if (old) old.remove();
+
+    root.classList.add("oracle-v14-booting");
+
+    const overlay = document.createElement("div");
+    overlay.className = "oracle-v14-boot-overlay";
+
+    const logo = document.createElement("pre");
+    logo.className = "oracle-v14-boot-logo";
+    logo.textContent = String.raw`
+         ::::::::  :::::::::  ::::::::::: :::::::::::     :::
+        :+:    :+: :+:    :+:     :+:         :+:       :+: :+:
+       +:+        +:+    +:+     +:+         +:+      +:+   +:+
+      +#+        +#++:++#:      +#+         +#+     +#++:++#++:
+     +#+        +#+    +#+     +#+         +#+     +#+     +#+
+    #+#    #+# #+#    #+#     #+#         #+#     #+#     #+#
+    ########  ###    ###  #####      ########### ###     ###
+  `.trimEnd();
+
+    overlay.appendChild(logo);
+    root.appendChild(overlay);
+
+    /* 强制让浏览器先记录初始 opacity: 0 */
+    overlay.getBoundingClientRect();
+
+    /* 下一帧进入 opacity: 1，实现渐入 */
+    requestAnimationFrame(() => {
+      overlay.classList.add("show");
+    });
+
+    /* 2 秒总时长，最后 360ms 渐出 */
+    setTimeout(() => {
+      overlay.classList.remove("show");
+      overlay.classList.add("hide");
+    }, Math.max(0, duration - 360));
+
+    setTimeout(() => {
+      overlay.remove();
+      root.classList.remove("oracle-v14-booting");
+    }, duration);
+
+    return overlay;
+  }
+
+  function afterOverlayPaint(fn) {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        setTimeout(fn, 0);
+      });
+    });
+  }
   function disableShell() {
     restoreNativeComposer();
+
+    state.popup.sidebar = false;
+    state.popup.thinking = false;
+    state.popup.chatbox = false;
+    state.popup.model = false;
+    state.popup.model = false;
+    restoreNativeModelMenusSoftly();
+    updatePopups();
+
     document.documentElement.classList.remove(ROOT_CLASS);
-    if (shell) shell.hidden = true;
+
+    if (shell) {
+      shell.hidden = false;
+      shell.classList.add(STANDBY_CLASS);
+    }
+
+    state.shellOn = false;
+    updateToggleButtonLabel();
   }
 
   function enableShell() {
     document.documentElement.classList.add(ROOT_CLASS);
-    if (shell) shell.hidden = false;
+
+    if (shell) {
+      shell.hidden = false;
+      shell.classList.remove(STANDBY_CLASS);
+    }
+
     state.shellOn = true;
     setBool(STORE_ON, true);
+    updateToggleButtonLabel();
     scheduleSync(50);
     requestRender();
   }
@@ -1266,20 +1575,778 @@
     return false;
   }
 
+  let hiddenNativeModelMenus = [];
+
   function triggerOriginalModelSelect() {
-    const btn = engineQsAll('button[aria-haspopup="menu"], [role="button"][aria-haspopup="menu"], button, [role="button"]').find((el) => {
-      const label = `${el.getAttribute("aria-label") || ""} ${txt(el)}`.toLowerCase();
-      return /model|gpt|o3|o4|4o|5|thinking|instant|选择模型|模型/.test(label);
-    });
-
-    if (btn) {
-      btn.click();
-      return true;
-    }
-
-    return false;
+    toggleModelPopup();
+    return true;
   }
 
+  function hardClick(el) {
+    if (!el) return false;
+
+    try {
+      el.scrollIntoView({
+        block: "center",
+        inline: "center"
+      });
+    } catch (_) {}
+
+    try {
+      el.focus();
+    } catch (_) {}
+
+    const rect = el.getBoundingClientRect();
+    const x = rect.left + Math.max(1, rect.width / 2);
+    const y = rect.top + Math.max(1, rect.height / 2);
+
+    const eventInit = {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX: x,
+      clientY: y
+    };
+
+    ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((type) => {
+      try {
+        el.dispatchEvent(new MouseEvent(type, eventInit));
+      } catch (_) {}
+    });
+
+    try {
+      el.click();
+    } catch (_) {}
+
+    return true;
+  }
+
+  function isVisibleEnough(el) {
+    if (!el) return false;
+
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) return false;
+
+    const style = window.getComputedStyle(el);
+    if (style.display === "none") return false;
+    if (style.visibility === "hidden") return false;
+
+    return true;
+  }
+
+  function getElementTextForModel(el) {
+    return String(el ? (el.innerText || el.textContent || "") : "")
+      .replace(/\u00a0/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function isInsideConversationMessage(el) {
+    return Boolean(
+      el &&
+      el.closest &&
+      el.closest('[data-message-author-role], article')
+    );
+  }
+
+  function looksLikeRetryOrMessageAction(label) {
+    return /(try again|retry|regenerate|response|continue|copy|edit|share|read aloud|重新|重试|再试|重新生成|继续|复制|编辑|分享)/i.test(
+      String(label || "")
+    );
+  }
+
+  function looksLikeModelOptionText(label) {
+    return /(gpt|o3|o4|4o|5\.5|5|auto|instant|medium|high|fast|thinking|mini|pro|model|intelligence|模型|智能|推理|快速)/i.test(
+      String(label || "")
+    );
+  }
+
+  function normalizeModelLabel(label) {
+    return String(label || "")
+      .replace(/\u00a0/g, " ")
+      .replace(/\s+/g, " ")
+      .replace(/^✓\s*/, "")
+      .trim();
+  }
+
+  function modelLabelScore(label) {
+    const raw = String(label || "");
+    let score = 0;
+
+    if (/(select model|switch model|model selector|model picker|choose model|选择模型|模型选择)/i.test(raw)) score += 80;
+    if (looksLikeModelOptionText(raw)) score += 25;
+    if (looksLikeRetryOrMessageAction(raw)) score -= 200;
+    if (/(send|stop|cancel|attach|upload|voice|dictate|share|copy|edit|sidebar|history|发送|停止|取消|附件|上传|语音|分享|复制|编辑|侧边栏|历史)/i.test(raw)) score -= 120;
+
+    return score;
+  }
+
+  function isDisabledControl(el) {
+    return Boolean(el && (el.disabled || el.getAttribute("aria-disabled") === "true"));
+  }
+
+  function hasRectSize(el, minWidth = 2, minHeight = 2) {
+    if (!el) return false;
+
+    const rect = el.getBoundingClientRect();
+    return rect.width >= minWidth && rect.height >= minHeight;
+  }
+
+  function getModelCandidateLabel(el) {
+    if (!el) return "";
+
+    return [
+      el.getAttribute("aria-label") || "",
+      el.getAttribute("data-testid") || "",
+      getElementTextForModel(el)
+    ].join(" ").trim();
+  }
+
+  function hasAllTerms(text, terms) {
+    return terms.every((term) => text.includes(term));
+  }
+
+  function pushSplitModelOptions(out, names, rootEl, menu, sourceLabel) {
+    names.forEach((name) => {
+      const child = findSmallestTextNodeElement(rootEl, name) || rootEl;
+      const target = getClickableAncestorForModel(child, menu);
+
+      out.push({
+        label: name,
+        el: target,
+        textEl: child,
+        sourceLabel,
+        split: true,
+        current: false
+      });
+    });
+  }
+
+  function pushUniqueModelOption(options, seen, option, key = option.label.toLowerCase()) {
+    if (seen.has(key)) return false;
+
+    seen.add(key);
+    options.push(option);
+    return true;
+  }
+
+  function getClickableAncestorForModel(el, stopAt = null) {
+    let node = el;
+
+    while (node && node !== document.body && node !== document.documentElement) {
+      if (
+        node.matches &&
+        node.matches(MODEL_CLICKABLE_SELECTOR)
+      ) {
+        return node;
+      }
+
+      if (stopAt && node === stopAt) break;
+
+      node = node.parentElement;
+    }
+
+    return el;
+  }
+
+  function findSmallestTextNodeElement(root, wantedLabel) {
+    const wanted = normalizeModelLabel(wantedLabel).toLowerCase();
+    if (!root || !wanted) return null;
+
+    const nodes = qsAll(MODEL_TEXT_SELECTOR, root);
+
+    const candidates = nodes
+      .map((el) => {
+        const text = normalizeModelLabel(getElementTextForModel(el));
+        return { el, text };
+      })
+      .filter((item) => {
+        if (!item.el || !item.text) return false;
+        if (!isVisibleEnough(item.el)) return false;
+
+        const lower = item.text.toLowerCase();
+
+        return lower === wanted || lower.includes(wanted);
+      });
+
+    if (!candidates.length) return null;
+
+    candidates.sort((a, b) => {
+      const al = a.text.toLowerCase();
+      const bl = b.text.toLowerCase();
+
+      let ascore = 0;
+      let bscore = 0;
+
+      if (al === wanted) ascore -= 1000;
+      if (bl === wanted) bscore -= 1000;
+
+      ascore += a.text.length;
+      bscore += b.text.length;
+
+      return ascore - bscore;
+    });
+
+    return candidates[0].el;
+  }
+
+  function extractSplitModelOptions(label, rootEl, menu) {
+    const text = normalizeModelLabel(label);
+    const lower = text.toLowerCase();
+
+    const out = [];
+
+    /*
+      ChatGPT sometimes renders this as one large row:
+      "Intelligence Instant Medium High"
+      We split it into the real selectable children.
+    */
+    const intelligenceGroup =
+      hasAllTerms(lower, ["intelligence", "instant", "medium", "high"]);
+
+    const compactReasoningGroup =
+      hasAllTerms(lower, ["instant", "medium", "high"]) &&
+      text.length < 120;
+
+    if (intelligenceGroup || compactReasoningGroup) {
+      pushSplitModelOptions(out, ["Instant", "Medium", "High"], rootEl, menu, text);
+      return out;
+    }
+
+    /*
+      Similar possible compact row:
+      "Speed Auto Fast Thinking"
+    */
+    const speedGroup =
+      hasAllTerms(lower, ["auto", "fast", "thinking"]) &&
+      text.length < 120;
+
+    if (speedGroup) {
+      pushSplitModelOptions(out, ["Auto", "Fast", "Thinking"], rootEl, menu, text);
+      return out;
+    }
+
+    return out;
+  }
+
+  function hasBetterChildModelOption(el, ownLabel) {
+    const own = normalizeModelLabel(ownLabel);
+    if (!el || !own) return false;
+
+    const children = qsAll(MODEL_CHILD_OPTION_SELECTOR, el);
+
+    return children.some((child) => {
+      if (!child || child === el) return false;
+      if (!isVisibleEnough(child)) return false;
+
+      const childText = normalizeModelLabel(getElementTextForModel(child));
+      if (!childText) return false;
+      if (childText === own) return false;
+      if (childText.length >= own.length) return false;
+
+      if (!looksLikeModelOptionText(childText)) return false;
+      if (looksLikeRetryOrMessageAction(childText)) return false;
+
+      return true;
+    });
+  }
+
+  function findRealModelButton() {
+    const prompt = findNativePromptOutsideShell() || getDockedNativePrompt();
+
+    const composer =
+      document.querySelector(`#${ROOT_ID} .oracle-v14-native-composer`) ||
+      findNativeComposerOutsideShell() ||
+      (prompt ? prompt.closest("form") : null) ||
+      (prompt ? prompt.closest('[data-testid*="composer" i]') : null) ||
+      (prompt ? prompt.closest('[class*="composer" i]') : null);
+
+    const searchBases = [];
+
+    if (composer) searchBases.push(composer);
+
+    searchBases.push(document);
+
+    const seen = new Set();
+    const candidates = [];
+
+    searchBases.forEach((base) => {
+      qsAll(
+        [
+          'button[aria-haspopup="menu"]',
+          'button[aria-haspopup="listbox"]',
+          '[role="button"][aria-haspopup="menu"]',
+          '[role="button"][aria-haspopup="listbox"]',
+          'button[data-testid*="model" i]',
+          '[role="button"][data-testid*="model" i]',
+          'button[aria-label*="model" i]',
+          '[role="button"][aria-label*="model" i]',
+          'button[aria-label*="模型" i]',
+          '[role="button"][aria-label*="模型" i]',
+          'button'
+        ].join(", "),
+        base
+      ).forEach((el) => {
+        if (!el) return;
+        if (seen.has(el)) return;
+        seen.add(el);
+
+        if (isMine(el) && !el.closest(".oracle-v14-native-composer")) return;
+        if (isInsideConversationMessage(el)) return;
+        if (isDisabledControl(el)) return;
+
+        const label = getModelCandidateLabel(el);
+        if (!label) return;
+
+        if (looksLikeRetryOrMessageAction(label)) return;
+
+        if (!hasRectSize(el)) return;
+
+        const explicit =
+          /(select model|switch model|model selector|model picker|choose model|选择模型|模型选择)/i.test(label) ||
+          /model/i.test(el.getAttribute("data-testid") || "") ||
+          /model/i.test(el.getAttribute("aria-label") || "");
+
+        const modelish =
+          /\b(gpt|o3|o4|4o|5\.5|5|thinking|instant|auto|fast|mini|pro)\b/i.test(label) ||
+          /(模型|推理|快速)/i.test(label);
+
+        if (!explicit && !modelish) return;
+
+        candidates.push(el);
+      });
+    });
+
+    if (!candidates.length) return null;
+
+    const promptRect = prompt ? prompt.getBoundingClientRect() : null;
+
+    candidates.sort((a, b) => {
+      const ar = a.getBoundingClientRect();
+      const br = b.getBoundingClientRect();
+
+      const alabel = getModelCandidateLabel(a);
+      const blabel = getModelCandidateLabel(b);
+
+      let ascore = -modelLabelScore(alabel);
+      let bscore = -modelLabelScore(blabel);
+
+      if (composer && composer.contains(a)) ascore -= 500;
+      if (composer && composer.contains(b)) bscore -= 500;
+
+      if (/model/i.test(a.getAttribute("data-testid") || "")) ascore -= 700;
+      if (/model/i.test(b.getAttribute("data-testid") || "")) bscore -= 700;
+
+      if (promptRect) {
+        const acx = (ar.left + ar.right) / 2;
+        const acy = (ar.top + ar.bottom) / 2;
+        const bcx = (br.left + br.right) / 2;
+        const bcy = (br.top + br.bottom) / 2;
+
+        ascore += Math.abs(acy - (promptRect.top + promptRect.bottom) / 2);
+        bscore += Math.abs(bcy - (promptRect.top + promptRect.bottom) / 2);
+
+        ascore += Math.abs(acx - promptRect.right) * 0.35;
+        bscore += Math.abs(bcx - promptRect.right) * 0.35;
+      } else {
+        ascore -= ar.top * 0.05;
+        bscore -= br.top * 0.05;
+      }
+
+      return ascore - bscore;
+    });
+
+    return candidates[0];
+  }
+
+  function dispatchModelShortcut() {
+    const eventInit = {
+      key: "M",
+      code: "KeyM",
+      bubbles: true,
+      cancelable: true,
+      ctrlKey: true,
+      shiftKey: true
+    };
+
+    try {
+      document.dispatchEvent(new KeyboardEvent("keydown", eventInit));
+      document.dispatchEvent(new KeyboardEvent("keyup", eventInit));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function getOpenNativeModelMenus() {
+    return engineQsAll(MODEL_MENU_SELECTOR)
+      .filter((el) => {
+        if (!el) return false;
+        if (isMine(el)) return false;
+        if (isInsideConversationMessage(el)) return false;
+
+        const text = getElementTextForModel(el);
+        if (!text) return false;
+        if (looksLikeRetryOrMessageAction(text)) return false;
+
+        if (!hasRectSize(el, 20, 20)) return false;
+
+        const modelHits = (text.match(/gpt|o3|o4|4o|5\.5|5|auto|instant|medium|high|thinking|fast|mini|pro|intelligence|模型|智能|推理|快速/gi) || []).length;
+
+        return modelHits >= 1;
+      });
+  }
+
+  function collectRealModelOptions() {
+    const menus = getOpenNativeModelMenus();
+
+    const seen = new Set();
+    const options = [];
+
+    menus.forEach((menu) => {
+      const nodes = qsAll(MODEL_OPTION_CANDIDATE_SELECTOR, menu);
+
+      nodes.forEach((el) => {
+        if (!el || isMine(el)) return;
+        if (isInsideConversationMessage(el)) return;
+        if (isDisabledControl(el)) return;
+        if (!isVisibleEnough(el)) return;
+
+        let label = normalizeModelLabel(getElementTextForModel(el));
+        if (!label) return;
+
+        if (label.length < 2 || label.length > 220) return;
+
+        if (looksLikeRetryOrMessageAction(label)) return;
+
+        if (/(new chat|temporary chat|customize|settings|upgrade|help|learn more|close|search|新聊天|临时聊天|设置|升级|帮助|关闭|搜索)/i.test(label)) {
+          return;
+        }
+
+        const split = extractSplitModelOptions(label, el, menu);
+
+        if (split.length) {
+          split.forEach((item) => {
+            pushUniqueModelOption(options, seen, item, `split:${item.label.toLowerCase()}`);
+          });
+
+          return;
+        }
+
+        if (!looksLikeModelOptionText(label)) return;
+
+        /*
+          Avoid parent rows swallowing child options.
+          This is the important part for "Intelligence / Instant / Medium / High".
+        */
+        if (hasBetterChildModelOption(el, label)) return;
+
+        /*
+          Reject large combined section labels that are not a single option.
+        */
+        if (
+          label.length > 80 &&
+          /(instant|medium|high)/i.test(label) &&
+          /(intelligence|智能)/i.test(label)
+        ) {
+          return;
+        }
+
+        const target = getClickableAncestorForModel(el, menu);
+        const finalLabel = label;
+
+        const ariaChecked = el.getAttribute("aria-checked") || target.getAttribute("aria-checked");
+        const ariaSelected = el.getAttribute("aria-selected") || target.getAttribute("aria-selected");
+
+        pushUniqueModelOption(options, seen, {
+          label: finalLabel,
+          el: target,
+          textEl: el,
+          sourceLabel: label,
+          split: false,
+          current: ariaChecked === "true" || ariaSelected === "true"
+        });
+      });
+    });
+
+    /*
+      If we still collected a giant combined option, remove it when its children exist.
+    */
+    const hasInstant = options.some((x) => /^instant$/i.test(x.label));
+    const hasMedium = options.some((x) => /^medium$/i.test(x.label));
+    const hasHigh = options.some((x) => /^high$/i.test(x.label));
+
+    const filtered = options.filter((x) => {
+      if ((hasInstant || hasMedium || hasHigh) && /intelligence/i.test(x.label) && /(instant|medium|high)/i.test(x.label)) {
+        return false;
+      }
+
+      return true;
+    });
+
+    return filtered.slice(0, 50);
+  }
+
+  function restoreNativeModelMenusSoftly() {
+    hiddenNativeModelMenus.forEach((item) => {
+      const menu = item && item.el;
+      if (!menu) return;
+
+      menu.style.opacity = item.opacity;
+      menu.style.pointerEvents = item.pointerEvents;
+      menu.style.transform = item.transform;
+      menu.style.zIndex = item.zIndex;
+    });
+
+    hiddenNativeModelMenus = [];
+  }
+
+  function hideNativeModelMenusSoftly() {
+    restoreNativeModelMenusSoftly();
+
+    const menus = getOpenNativeModelMenus();
+
+    hiddenNativeModelMenus = menus.map((menu) => ({
+      el: menu,
+      opacity: menu.style.opacity || "",
+      pointerEvents: menu.style.pointerEvents || "",
+      transform: menu.style.transform || "",
+      zIndex: menu.style.zIndex || ""
+    }));
+
+    menus.forEach((menu) => {
+      /*
+        Do not move the menu offscreen.
+        Moving it breaks coordinate-based and React-based clicks.
+      */
+      menu.style.setProperty("opacity", "0", "important");
+      menu.style.setProperty("pointer-events", "none", "important");
+      menu.style.setProperty("transform", "none", "important");
+    });
+  }
+
+  function findOpenOptionByLabel(label) {
+    const wanted = normalizeModelLabel(label).toLowerCase();
+    if (!wanted) return null;
+
+    const menus = getOpenNativeModelMenus();
+
+    for (const menu of menus) {
+      const exact = findSmallestTextNodeElement(menu, label);
+
+      if (exact) {
+        return getClickableAncestorForModel(exact, menu);
+      }
+    }
+
+    return null;
+  }
+
+  function renderModelPopup(statusText = "") {
+    const body = document.getElementById("oracle-v14-model-body");
+    if (!body) return;
+
+    body.textContent = "";
+
+    if (statusText) {
+      const status = document.createElement("div");
+      status.className = "oracle-v14-model-status";
+      status.textContent = statusText;
+      body.appendChild(status);
+    }
+
+    const options = state.data.modelOptions || [];
+
+    if (!options.length) {
+      const empty = document.createElement("div");
+      empty.className = "oracle-v14-empty";
+      empty.textContent = "NO REAL MODEL OPTIONS DETECTED. TRY OPENING CHATBOX ONCE, THEN PRESS MODEL SELECT AGAIN.";
+      body.appendChild(empty);
+      return;
+    }
+
+    options.forEach((option, idx) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `oracle-v14-model-option${option.current ? " current" : ""}`;
+      btn.textContent = option.label;
+
+      btn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+
+        selectRealModelOption(idx);
+      });
+
+      body.appendChild(btn);
+    });
+  }
+
+  function refreshRealModelOptionsAfterOpen(source = "button") {
+    restoreNativeModelMenusSoftly();
+
+    const options = collectRealModelOptions();
+
+    state.data.modelOptions = options;
+
+    if (!options.length) {
+      renderModelPopup(
+        source === "shortcut"
+          ? "REAL MODEL MENU WAS NOT DETECTED AFTER CTRL+SHIFT+M."
+          : "REAL MODEL MENU WAS NOT DETECTED. TRYING CTRL+SHIFT+M FALLBACK..."
+      );
+
+      if (source !== "shortcut") {
+        dispatchModelShortcut();
+
+        setTimeout(() => {
+          refreshRealModelOptionsAfterOpen("shortcut");
+        }, 420);
+      }
+
+      return;
+    }
+
+    renderModelPopup(`REAL MODEL OPTIONS DETECTED: ${options.length}`);
+
+    /*
+      Hide native menu from view, but keep it in the DOM.
+      We restore it before actually clicking.
+    */
+    hideNativeModelMenusSoftly();
+  }
+
+  function toggleModelPopup() {
+    state.popup.model = !state.popup.model;
+
+    if (!state.popup.model) {
+      updatePopups();
+      state.data.modelOptions = [];
+      restoreNativeModelMenusSoftly();
+      return;
+    }
+
+    state.popup.sidebar = false;
+    state.popup.thinking = false;
+    updatePopups();
+
+    state.data.modelOptions = [];
+    renderModelPopup("OPENING REAL CHATGPT MODEL SELECTOR...");
+
+    restoreNativeModelMenusSoftly();
+
+    const btn = findRealModelButton();
+
+    if (!btn) {
+      renderModelPopup("REAL CHATGPT MODEL BUTTON NOT FOUND. TRYING CTRL+SHIFT+M FALLBACK...");
+      dispatchModelShortcut();
+
+      setTimeout(() => {
+        refreshRealModelOptionsAfterOpen("shortcut");
+      }, 500);
+
+      return;
+    }
+
+    const label = `${btn.getAttribute("aria-label") || ""} ${btn.getAttribute("data-testid") || ""} ${getElementTextForModel(btn)}`;
+
+    if (looksLikeRetryOrMessageAction(label) || isInsideConversationMessage(btn)) {
+      renderModelPopup("WRONG BUTTON REJECTED: RETRY / MESSAGE ACTION BUTTON. TRYING CTRL+SHIFT+M FALLBACK...");
+      dispatchModelShortcut();
+
+      setTimeout(() => {
+        refreshRealModelOptionsAfterOpen("shortcut");
+      }, 500);
+
+      return;
+    }
+
+    hardClick(btn);
+
+    setTimeout(() => {
+      refreshRealModelOptionsAfterOpen("button");
+    }, 420);
+
+    setTimeout(() => {
+      if (!state.data.modelOptions || !state.data.modelOptions.length) {
+        refreshRealModelOptionsAfterOpen("button");
+      }
+    }, 960);
+  }
+
+  function selectRealModelOption(index) {
+    const option = state.data.modelOptions && state.data.modelOptions[index];
+
+    if (!option || !option.label) {
+      renderModelPopup("MODEL OPTION LOST. PRESS MODEL SELECT AGAIN.");
+      return;
+    }
+
+    renderModelPopup(`SWITCHING MODEL: ${option.label}`);
+
+    restoreNativeModelMenusSoftly();
+
+    const clickNow = () => {
+      /*
+        First, try to find the current live DOM option by label.
+        This is safer than clicking an old saved element.
+      */
+      let target = findOpenOptionByLabel(option.label);
+
+      if (!target && option.el && document.contains(option.el)) {
+        target = option.el;
+      }
+
+      if (target) {
+        hardClick(target);
+
+        setTimeout(() => {
+          state.popup.model = false;
+          updatePopups();
+          state.data.modelOptions = [];
+          restoreNativeModelMenusSoftly();
+          scheduleSync(350);
+        }, 360);
+
+        return;
+      }
+
+      /*
+        If the real menu closed, reopen it and try again.
+      */
+      const btn = findRealModelButton();
+
+      if (!btn) {
+        renderModelPopup(`FAILED TO SWITCH: REAL MODEL BUTTON LOST FOR ${option.label}`);
+        return;
+      }
+
+      hardClick(btn);
+
+      setTimeout(() => {
+        const reopenedTarget = findOpenOptionByLabel(option.label);
+
+        if (!reopenedTarget) {
+          renderModelPopup(`FAILED TO FIND REAL OPTION AFTER REOPEN: ${option.label}`);
+          return;
+        }
+
+        hardClick(reopenedTarget);
+
+        setTimeout(() => {
+          state.popup.model = false;
+          updatePopups();
+          state.data.modelOptions = [];
+          restoreNativeModelMenusSoftly();
+          scheduleSync(350);
+        }, 360);
+      }, 420);
+    };
+
+    requestAnimationFrame(() => {
+      setTimeout(clickNow, 0);
+    });
+  }
   function isChatGPTThinking() {
     const stopBtn = engineQsAll(
       [
@@ -1358,7 +2425,59 @@
       .replace(/\r\n/g, "\n")
       .replace(/\r/g, "\n")
       .replace(/\u00a0/g, " ")
+      .replace(/[\u200B-\u200D\uFEFF]/g, "")
+      .replace(/^\n+/, "")
       .replace(/\n+$/g, "");
+  }
+
+  function scoreCodeTextForIndentation(str) {
+    const lines = String(str || "").split("\n");
+    let score = 0;
+
+    score += lines.length * 3;
+
+    lines.forEach((line) => {
+      if (/^[ \t]+/.test(line)) score += 5;
+      if (line.includes("  ")) score += 1;
+      if (/[{}()[\];,:]/.test(line)) score += 1;
+    });
+
+    return score;
+  }
+
+  function extractRawCodeTextFromPre(preEl) {
+    if (!preEl) return "";
+
+    const codeEl = preEl.querySelector("code") || preEl;
+
+    const lineNodes = Array.from(
+      codeEl.querySelectorAll('[data-line], [data-testid*="line" i], [class~="line"]')
+    ).filter((node) => {
+      const text = node.textContent || "";
+      return text.length > 0;
+    });
+
+    if (lineNodes.length >= 2) {
+      const byLines = lineNodes
+        .map((node) => node.textContent || "")
+        .join("\n");
+
+      const normalizedByLines = normalizeCodeText(byLines);
+
+      if (normalizedByLines.trim()) {
+        return normalizedByLines;
+      }
+    }
+
+    const fromTextContent = normalizeCodeText(codeEl.textContent || "");
+    const fromInnerText = normalizeCodeText(codeEl.innerText || "");
+
+    if (!fromTextContent) return fromInnerText;
+    if (!fromInnerText) return fromTextContent;
+
+    return scoreCodeTextForIndentation(fromInnerText) > scoreCodeTextForIndentation(fromTextContent)
+      ? fromInnerText
+      : fromTextContent;
   }
 
   function extractMessageSegments(root) {
@@ -1410,13 +2529,13 @@
       if (tag === "PRE") {
         flushProse();
 
-        const codeNode = el.querySelector("code") || el;
-        const codeText = normalizeCodeText(codeNode.textContent || codeNode.innerText || "");
+        const codeText = extractRawCodeTextFromPre(el);
 
         if (codeText.trim()) {
           segments.push({
             type: "code",
-            text: codeText
+            text: codeText,
+            copyText: codeText
           });
         }
 
@@ -1455,9 +2574,17 @@
     return segments;
   }
 
-  function cleanThinkingTitle(raw) {
-    const firstLine = String(raw || "")
+  function cleanThinkingText(raw) {
+    return String(raw || "")
       .replace(/\u00a0/g, " ")
+      .replace(/\s+\n/g, "\n")
+      .replace(/\n\s+/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
+  function cleanThinkingTitle(raw) {
+    const firstLine = cleanThinkingText(raw)
       .split(/\n+/)
       .map((x) => x.trim())
       .find(Boolean) || "";
@@ -1469,47 +2596,69 @@
       .trim();
   }
 
-  function extractThinkingModuleTitle(el) {
-    if (!el) return "";
+  function looksLikeThinkingText(raw) {
+    return /(thinking|reasoning|reasoned|thought|analyz|analysis|search|reading|browse|tool|思考|推理|分析|搜索|检索|浏览|读取|工具)/i.test(String(raw || ""));
+  }
+
+  function looksLikeNonThinkingUi(raw) {
+    return /(model|selector|sidebar|history|conversation|menu|gpt|o3|o4|4o|share|copy|edit|retry|模型|侧边栏|历史|菜单)/i.test(String(raw || ""));
+  }
+
+  function extractThinkingBlock(el) {
+    if (!el) return null;
 
     const summary = el.matches && el.matches("details")
       ? el.querySelector("summary")
       : null;
 
-    const aria = el.getAttribute ? el.getAttribute("aria-label") : "";
-    const testid = el.getAttribute ? el.getAttribute("data-testid") : "";
+    const aria = el.getAttribute ? el.getAttribute("aria-label") || "" : "";
+    const testid = el.getAttribute ? el.getAttribute("data-testid") || "" : "";
 
-    const raw =
-      cleanThinkingTitle(summary ? txt(summary) : "") ||
+    const fullText = cleanThinkingText(el.innerText || el.textContent || "");
+    const summaryText = cleanThinkingText(summary ? (summary.innerText || summary.textContent || "") : "");
+
+    const title =
+      cleanThinkingTitle(summaryText) ||
       cleanThinkingTitle(aria) ||
-      cleanThinkingTitle(txt(el)) ||
+      cleanThinkingTitle(fullText) ||
       cleanThinkingTitle(testid);
 
-    if (!raw) return "";
+    if (!title && !fullText) return null;
 
-    const lower = raw.toLowerCase();
+    const combined = `${title}\n${fullText}\n${aria}\n${testid}`;
 
-    if (/model|selector|sidebar|history|conversation|menu|gpt|o3|o4|4o|模型|侧边栏|历史/.test(lower)) {
-      return "";
+    if (!looksLikeThinkingText(combined)) return null;
+    if (looksLikeNonThinkingUi(title) && !looksLikeThinkingText(fullText)) return null;
+
+    let content = fullText;
+
+    if (summaryText && content.startsWith(summaryText)) {
+      content = content.slice(summaryText.length).trim();
     }
 
-    if (!/(thinking|reasoning|reasoned|thought|analyz|search|reading|browse|tool|思考|推理|分析|搜索|检索|浏览|读取|工具)/i.test(raw)) {
-      return "";
+    if (!content || content.length < 3) {
+      content = fullText || title;
     }
 
-    return raw;
+    return {
+      title: title || "visible thinking",
+      content: content || title || "visible thinking"
+    };
   }
 
   function collectVisibleThinkingModules() {
     const nodes = engineQsAll([
       'main details',
-      'main summary',
-      'main button',
-      'main [role="button"]',
       'main [data-testid*="thinking" i]',
       'main [data-testid*="reasoning" i]',
+      'main [data-testid*="thought" i]',
       'main [class*="thinking" i]',
-      'main [class*="reasoning" i]'
+      'main [class*="reasoning" i]',
+      'main [class*="thought" i]',
+      'main [aria-label*="Thinking" i]',
+      'main [aria-label*="Reasoning" i]',
+      'main [aria-label*="思考" i]',
+      'main [aria-label*="推理" i]'
     ].join(", "));
 
     const seen = new Set();
@@ -1518,20 +2667,207 @@
     nodes.forEach((el) => {
       if (!usableDomNode(el)) return;
 
-      const title = extractThinkingModuleTitle(el);
-      if (!title) return;
+      const block = extractThinkingBlock(el);
+      if (!block) return;
 
-      const key = title.toLowerCase();
+      const key = `${block.title}\n${block.content}`.toLowerCase();
 
       if (seen.has(key)) return;
       seen.add(key);
 
-      modules.push({
-        title
-      });
+      modules.push(block);
     });
 
     return modules.slice(-8);
+  }
+
+  function normalizeSidebarHref(href) {
+    return String(href || "").replace(/#.*$/, "");
+  }
+
+  function sidebarLinkKey(link) {
+    const href = normalizeSidebarHref(link && link.href);
+    const label = String(link && link.label || "");
+
+    return href.includes("/c/") ? href : `${href}|${label}`;
+  }
+
+  function collectCurrentSidebarLinks() {
+    return engineQsAll(SIDEBAR_LINK_SELECTOR)
+      .map((a) => {
+        const label = txt(a);
+        const href = normalizeSidebarHref(a.href || a.getAttribute("href") || "");
+
+        return { label, href, el: a };
+      })
+      .filter((link) => {
+        if (!link.label || link.label.length < 2) return false;
+        if (/skip|privacy|terms/i.test(link.label)) return false;
+        if (!link.href) return false;
+
+        return true;
+      });
+  }
+
+  function mergeSidebarLinks(currentLinks) {
+    const out = [];
+    const byKey = new Map();
+
+    const remember = (link) => {
+      const key = sidebarLinkKey(link);
+      if (!key) return;
+
+      const existing = byKey.get(key);
+
+      if (existing) {
+        if (link.el) existing.el = link.el;
+        if (link.href) existing.href = link.href;
+        if (link.label && link.label.length >= existing.label.length) {
+          existing.label = link.label;
+        }
+
+        return;
+      }
+
+      const item = {
+        label: link.label,
+        href: normalizeSidebarHref(link.href),
+        el: link.el || null
+      };
+
+      byKey.set(key, item);
+      out.push(item);
+    };
+
+    (state.data.chatLinks || []).forEach(remember);
+    currentLinks.forEach(remember);
+
+    return out;
+  }
+
+  function sidebarScrollerCandidateInfo(el) {
+    if (!el || isMine(el)) return null;
+
+    const clientHeight = el.clientHeight || 0;
+    const scrollHeight = el.scrollHeight || 0;
+
+    if (clientHeight < 20 || scrollHeight <= clientHeight + 32) return null;
+
+    const chatCount = qsAll(CHAT_LINK_SELECTOR, el).length;
+    if (!chatCount) return null;
+
+    return {
+      el,
+      chatCount,
+      scrollableRange: scrollHeight - clientHeight
+    };
+  }
+
+  function findNativeSidebarScroller() {
+    const candidates = new Map();
+    const addCandidate = (el) => {
+      const info = sidebarScrollerCandidateInfo(el);
+      if (info && !candidates.has(info.el)) {
+        candidates.set(info.el, info);
+      }
+    };
+
+    engineQsAll(CHAT_LINK_SELECTOR).forEach((link) => {
+      let node = link.parentElement;
+      let depth = 0;
+
+      while (node && node !== document.body && depth < 12) {
+        addCandidate(node);
+        node = node.parentElement;
+        depth += 1;
+      }
+    });
+
+    engineQsAll(SIDEBAR_CONTAINER_SELECTOR).forEach((root) => {
+      addCandidate(root);
+      qsAll("div, nav, aside, section", root).forEach(addCandidate);
+    });
+
+    return Array.from(candidates.values())
+      .sort((a, b) => {
+        if (b.chatCount !== a.chatCount) return b.chatCount - a.chatCount;
+        return b.scrollableRange - a.scrollableRange;
+      })[0]?.el || null;
+  }
+
+  function scrollNativeSidebarForOlderChats() {
+    const scroller = findNativeSidebarScroller();
+    if (!scroller) return false;
+
+    const beforeTop = scroller.scrollTop || 0;
+    const maxScroll = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    if (maxScroll <= 0) return false;
+
+    const step = Math.max(420, Math.round((scroller.clientHeight || 0) * 0.85));
+    const nextTop = Math.min(maxScroll, beforeTop + step);
+
+    scroller.scrollTop = nextTop;
+
+    try {
+      scroller.dispatchEvent(new WheelEvent("wheel", {
+        bubbles: true,
+        cancelable: true,
+        deltaY: step
+      }));
+    } catch (_) {}
+
+    scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+
+    return scroller.scrollTop !== beforeTop || beforeTop < maxScroll;
+  }
+
+  function isSidebarPopupNearBottom() {
+    const body = document.getElementById("oracle-v14-sidebar-body");
+    if (!body) return false;
+
+    return body.scrollTop + body.clientHeight >= body.scrollHeight - 96;
+  }
+
+  function requestSidebarHistoryLoad(delay = 120) {
+    clearTimeout(sidebarLoadTimer);
+    sidebarLoadTimer = setTimeout(loadMoreSidebarChats, delay);
+  }
+
+  function loadMoreSidebarChats() {
+    if (sidebarAutoLoadBusy) return false;
+
+    sidebarAutoLoadBusy = true;
+    refreshSidebarPopup();
+
+    const beforeCount = (state.data.chatLinks || []).length;
+    const moved = scrollNativeSidebarForOlderChats();
+
+    if (!moved) {
+      sidebarAutoLoadBusy = false;
+      refreshSidebarPopup();
+      return false;
+    }
+
+    setTimeout(() => {
+      collectData();
+      sidebarAutoLoadBusy = false;
+      refreshSidebarPopup();
+
+      if (
+        state.popup.sidebar &&
+        state.data.chatLinks.length > beforeCount &&
+        isSidebarPopupNearBottom()
+      ) {
+        requestSidebarHistoryLoad(360);
+      }
+    }, 700);
+
+    return true;
+  }
+
+  function onSidebarPopupScroll() {
+    if (!state.popup.sidebar || sidebarAutoLoadBusy) return;
+    if (isSidebarPopupNearBottom()) requestSidebarHistoryLoad(140);
   }
 
   function collectData() {
@@ -1558,32 +2894,25 @@
       })
       .filter((m) => m.content);
 
-    const thinking = currentlyThinking || state.popup.thinking
-      ? engineQsAll('details, [data-testid*="thinking" i], [data-testid*="reasoning" i], [class*="thinking" i], [class*="reasoning" i]')
-          .filter(usableDomNode)
-          .map((el) => txt(el))
-          .filter(Boolean)
-          .slice(-8)
-      : [];
-
-    const thinkingModules = currentlyThinking
+    const thinkingModules = currentlyThinking || state.popup.thinking
       ? collectVisibleThinkingModules()
       : [];
 
-    const links = [];
-    const seen = new Set();
+    const thinking = thinkingModules
+      .map((module) => {
+        const title = module.title || "visible thinking";
+        const content = module.content || "";
 
-    engineQsAll('nav a, aside a, [data-testid="sidebar"] a, a[href^="/c/"], a[href*="/c/"]').forEach((a) => {
-      const label = txt(a);
-      if (!label || label.length < 2) return;
-      if (/skip|privacy|terms/i.test(label)) return;
+        if (!content || content === title) {
+          return title;
+        }
 
-      const key = `${a.href}|${label}`;
-      if (seen.has(key)) return;
+        return `${title}\n\n${content}`;
+      })
+      .filter(Boolean)
+      .slice(-8);
 
-      seen.add(key);
-      links.push({ label, el: a });
-    });
+    const links = mergeSidebarLinks(collectCurrentSidebarLinks());
 
     const inlineDraft = readInlineDraft();
     const nativePrompt = getDockedNativePrompt() || findNativePromptOutsideShell();
@@ -1610,33 +2939,67 @@
       draft,
       chatLinks: links,
       modelLabel,
+      modelOptions: state.data.modelOptions || [],
       isThinking: currentlyThinking
     };
+  }
+
+  function openSidebarLink(link) {
+    if (!link) return;
+
+    if (link.el && document.documentElement.contains(link.el)) {
+      link.el.click();
+      return;
+    }
+
+    if (link.href) {
+      window.location.assign(link.href);
+    }
+  }
+
+  function appendSidebarLoadButton(body) {
+    const btn = document.createElement("button");
+    btn.className = "oracle-v14-link-btn";
+    btn.textContent = sidebarAutoLoadBusy ? "LOADING OLDER CHATS..." : "LOAD OLDER CHATS";
+    btn.disabled = sidebarAutoLoadBusy;
+    btn.addEventListener("click", () => {
+      requestSidebarHistoryLoad(0);
+    });
+    body.appendChild(btn);
   }
 
   function refreshSidebarPopup() {
     const body = document.getElementById("oracle-v14-sidebar-body");
     if (!body) return;
 
+    const previousScrollTop = body.scrollTop;
+
     body.textContent = "";
 
     if (!state.data.chatLinks.length) {
-      body.innerHTML = `<div class="oracle-v14-empty">NO SIDEBAR ITEMS DETECTED.</div>`;
+      const empty = document.createElement("div");
+      empty.className = "oracle-v14-empty";
+      empty.textContent = "NO SIDEBAR ITEMS DETECTED.";
+      body.appendChild(empty);
+      appendSidebarLoadButton(body);
       return;
     }
 
-    state.data.chatLinks.slice(0, 50).forEach(({ label, el }) => {
+    state.data.chatLinks.forEach((link) => {
       const btn = document.createElement("button");
       btn.className = "oracle-v14-link-btn";
-      btn.textContent = label;
+      btn.textContent = link.label;
       btn.addEventListener("click", () => {
-        el.click();
+        openSidebarLink(link);
         state.popup.sidebar = false;
         updatePopups();
         scheduleSync(350);
       });
       body.appendChild(btn);
     });
+
+    appendSidebarLoadButton(body);
+    body.scrollTop = Math.min(previousScrollTop, body.scrollHeight);
   }
 
   function refreshThinkingPopup() {
@@ -1645,18 +3008,27 @@
 
     body.textContent = "";
 
-    if (!state.data.thinking.length) {
-      body.innerHTML = `<div class="oracle-v14-empty">NO VISIBLE THINKING BLOCK DETECTED.</div>`;
+    const modules = state.data.thinkingModules && state.data.thinkingModules.length
+      ? state.data.thinkingModules
+      : [];
+
+    if (!modules.length) {
+      body.innerHTML = `<div class="oracle-v14-empty">NO VISIBLE THINKING BLOCK DETECTED. THE PAGE MAY NOT EXPOSE THINKING CONTENT.</div>`;
       return;
     }
 
-    state.data.thinking.forEach((item, idx) => {
+    modules.forEach((module, idx) => {
       const div = document.createElement("div");
-      div.style.marginBottom = "14px";
+      div.style.marginBottom = "16px";
+
+      const title = escapeHtml(module.title || `THINKING SIGNAL ${idx + 1}`);
+      const content = escapeHtml(module.content || "");
+
       div.innerHTML = `
-        <div class="oracle-v14-line-head">#--- THINKING SIGNAL ${idx + 1}</div>
-        <div>${escapeHtml(item)}</div>
+        <div class="oracle-v14-line-head">#--- ${title}</div>
+        <div>${content}</div>
       `;
+
       body.appendChild(div);
     });
   }
@@ -1694,7 +3066,7 @@
       d: draft,
       model: modelLabel,
       thinking: isThinking,
-      thinkingModules: thinkingModules.map((x) => x.title),
+      thinkingModules: thinkingModules.map((x) => [x.title, x.content]),
       focused: inputFocused
     });
   }
@@ -1824,6 +3196,14 @@
 
     glProgram = program;
     gl.useProgram(program);
+    glUniforms = {
+      curve: gl.getUniformLocation(program, "u_curve"),
+      tex: gl.getUniformLocation(program, "u_tex")
+    };
+
+    if (glUniforms.tex) {
+      gl.uniform1i(glUniforms.tex, 0);
+    }
 
     const posBuffer = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
@@ -2043,13 +3423,15 @@
 
       try {
         const ok = document.execCommand("copy");
-        document.body.removeChild(ta);
 
         if (ok) resolve();
         else reject(new Error("copy command failed"));
       } catch (err) {
-        document.body.removeChild(ta);
         reject(err);
+      } finally {
+        if (ta.parentNode) {
+          ta.parentNode.removeChild(ta);
+        }
       }
     });
   }
@@ -2114,7 +3496,9 @@
   }
 
   function pushCodeBlockLines(lines, codeText, contentW, ctx, codeId) {
-    wrapCodeText(codeText, contentW, ctx).forEach((ln) => {
+    const copyText = String(codeText || "");
+
+    wrapCodeText(copyText, contentW, ctx).forEach((ln) => {
       lines.push({
         text: ln,
         color: COLORS.amberHot,
@@ -2129,7 +3513,7 @@
       head: false,
       kind: "copyButton",
       codeId,
-      codeText
+      codeText: copyText
     });
   }
 
@@ -2140,7 +3524,7 @@
       messages: state.data.messages.map((msg) => [
         msg.role,
         msg.content,
-        (msg.segments || []).map((seg) => [seg.type, seg.text])
+        (msg.segments || []).map((seg) => [seg.type, seg.text, seg.copyText || ""])
       ])
     });
   }
@@ -2203,7 +3587,13 @@
         if (segment.type === "code") {
           codeBlockCounter += 1;
           ctx.font = codeFont;
-          pushCodeBlockLines(lines, segment.text, contentW, ctx, `code-${idx}-${codeBlockCounter}`);
+          pushCodeBlockLines(
+            lines,
+            segment.copyText || segment.text,
+            contentW,
+            ctx,
+            `code-${idx}-${codeBlockCounter}`
+          );
           ctx.font = bodyFont;
           return;
         }
@@ -2292,6 +3682,61 @@
     });
   }
 
+  function appendThinkingProgressLines(lines) {
+    if (!state.data.isThinking) return;
+
+    const modules = state.data.thinkingModules && state.data.thinkingModules.length
+      ? state.data.thinkingModules
+      : [{ title: "answer generation", content: "" }];
+
+    modules.forEach((module, moduleIdx) => {
+      makeThinkingProgressLines(module.title, moduleIdx + 1, modules.length).forEach((ln, idx) => {
+        lines.push({
+          text: ln,
+          color: idx < 2 ? COLORS.amberDim : COLORS.amberHot,
+          head: idx === 2
+        });
+      });
+
+      lines.push({
+        text: "",
+        color: COLORS.amber,
+        head: false
+      });
+    });
+  }
+
+  function drawTerminalLines(lines, layout, fonts) {
+    let y = layout.padTop - state.mainScrollY;
+
+    for (const line of lines) {
+      if (y > -layout.lineHeight && y < layout.contentH + layout.padTop) {
+        if (line.kind === "copyButton") {
+          drawCopyButtonLine(
+            offctx,
+            line.text,
+            layout.padX,
+            y,
+            layout.contentW,
+            layout.lineHeight,
+            fonts.copyButton
+          );
+        } else {
+          drawGlowText(
+            offctx,
+            line.text,
+            layout.padX,
+            y,
+            line.color,
+            line.code ? fonts.code : (line.head ? fonts.head : fonts.body)
+          );
+        }
+      }
+
+      y += layout.lineHeight;
+    }
+  }
+
   function renderMainTerminal() {
     if (!offctx || !gl || !glProgram || !screenCanvas) return;
 
@@ -2322,27 +3767,7 @@
 
     const lines = buildStaticMessageLines(contentW, bodyFont, codeFont, offctx);
 
-    if (state.data.isThinking) {
-      const modules = state.data.thinkingModules && state.data.thinkingModules.length
-        ? state.data.thinkingModules
-        : [{ title: "answer generation" }];
-
-      modules.forEach((module, moduleIdx) => {
-        makeThinkingProgressLines(module.title, moduleIdx + 1, modules.length).forEach((ln, idx) => {
-          lines.push({
-            text: ln,
-            color: idx < 2 ? COLORS.amberDim : COLORS.amberHot,
-            head: idx === 2
-          });
-        });
-
-        lines.push({
-          text: "",
-          color: COLORS.amber,
-          head: false
-        });
-      });
-    }
+    appendThinkingProgressLines(lines);
 
     const draft = state.data.draft || "";
     const cursorVisible = state.inputFocused && Math.floor(performance.now() / 530) % 2 === 0;
@@ -2377,34 +3802,16 @@
 
     updateSelectableLayer(lines, lineHeight, padTop, state.mainScrollY, blankScrollHeight);
 
-    let y = padTop - state.mainScrollY;
-
-    for (const line of lines) {
-      if (y > -lineHeight && y < contentH + padTop) {
-        if (line.kind === "copyButton") {
-          drawCopyButtonLine(
-            offctx,
-            line.text,
-            padX,
-            y,
-            contentW,
-            lineHeight,
-            copyButtonFont
-          );
-        } else {
-          drawGlowText(
-            offctx,
-            line.text,
-            padX,
-            y,
-            line.color,
-            line.code ? codeFont : (line.head ? headFont : bodyFont)
-          );
-        }
+    drawTerminalLines(
+      lines,
+      { padX, padTop, contentW, contentH, lineHeight },
+      {
+        head: headFont,
+        body: bodyFont,
+        code: codeFont,
+        copyButton: copyButtonFont
       }
-
-      y += lineHeight;
-    }
+    );
 
     offctx.restore();
 
@@ -2412,8 +3819,9 @@
     gl.bindTexture(gl.TEXTURE_2D, glTex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, offscreen);
 
-    const curveLoc = gl.getUniformLocation(glProgram, "u_curve");
-    gl.uniform1f(curveLoc, 0.11);
+    if (glUniforms.curve) {
+      gl.uniform1f(glUniforms.curve, 0.11);
+    }
 
     gl.clearColor(0, 0, 0, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
@@ -2433,14 +3841,14 @@
     buildShell();
 
     if (!initWebGL()) {
-      console.error("[oracle-v14-performance] WebGL init failed.");
+      console.error("[oracle-v14-standby-toggle] WebGL init failed.");
       return;
     }
 
     resizeCanvases();
 
     if (getBool(STORE_ON, true)) {
-      enableShell();
+      enableShell(true);
     } else {
       disableShell();
     }
@@ -2496,13 +3904,19 @@
       if (event.altKey && event.shiftKey && event.key.toLowerCase() === "o") {
         const nowOn = document.documentElement.classList.contains(ROOT_CLASS);
 
-        if (nowOn) {
-          setBool(STORE_ON, false);
-          disableShell();
-        } else {
-          setBool(STORE_ON, true);
-          enableShell();
-        }
+        showBootOverlay(2000);
+
+        afterOverlayPaint(() => {
+          if (nowOn) {
+            setBool(STORE_ON, false);
+            disableShell();
+          } else {
+            setBool(STORE_ON, true);
+            enableShell();
+          }
+
+          updateToggleButtonLabel();
+        });
       }
     });
 
@@ -2518,7 +3932,9 @@
       }
     }, 1400);
 
-    console.log("[Oracle CRT v14.7 Performance] loaded. Alt+Shift+O toggles shell.");
+    updateToggleButtonLabel();
+
+    console.log("[Oracle CRT v14.9 Standby Toggle] loaded. Alt+Shift+O toggles shell.");
   }
 
   function waitForBody() {
