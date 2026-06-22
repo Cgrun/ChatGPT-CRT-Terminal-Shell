@@ -1,6 +1,5 @@
 // ==UserScript==
-// @name         J's Oracle CRT Terminal Shell for ChatGPT v15 optimized
-// @namespace    js-oracle-crt-chatgpt-v14
+// @name         J's Oracle CRT Terminal Shell for ChatGPT v15.8
 // @version      1.4.9
 // @description  A retro WebGL CRT terminal interface for ChatGPT with curved-screen rendering, inline terminal input, popup composer, visible thinking-status display, preserved code formatting, glowing copy-code controls, and persistent SCRIPT ON/OFF standby toggle.
 // @author       CrJia
@@ -20,13 +19,16 @@
   const STORE_ON = "oracleCrtV14Enabled";
 
   const MAX_MESSAGES = 12;
+  const DICTATE_MATRIX_SIZE = 11;
 
   const COLORS = {
-    amber: "#e08901",
-    amberHot: "#eda227",
-    amberStrong: "#ffb000",
+    amber: "#efa13a",
+    amberHot: "#ffb14f",
+    amberStrong: "#ffc15f",
     amberDim: "#bf7302",
     amberDeep: "#694302",
+    answer: "#FF9900",
+    answerHot: "#ffc04c",
     red: "#e05a1a",
     black: "#000000",
     select: "#ffcf03",
@@ -107,6 +109,53 @@
 
   const CHAT_LINK_SELECTOR = 'a[href^="/c/"], a[href*="/c/"]';
 
+  const THINKING_NODE_SELECTOR = [
+    "main details",
+    'main [data-testid*="thinking" i]',
+    'main [data-testid*="reasoning" i]',
+    'main [data-testid*="reason" i]',
+    'main [data-testid*="thought" i]',
+    'main [class*="thinking" i]',
+    'main [class*="reasoning" i]',
+    'main [class*="reason" i]',
+    'main [class*="thought" i]',
+    'main [aria-label*="Thinking" i]',
+    'main [aria-label*="Reasoning" i]',
+    'main [aria-label*="Reasoned" i]',
+    'main [aria-label*="Thought" i]',
+    'main [aria-label*="思考" i]',
+    'main [aria-label*="推理" i]'
+  ].join(", ");
+
+  const THINKING_TRIGGER_SELECTOR = [
+    "main summary",
+    "main button",
+    'main [role="button"]',
+    'main [aria-expanded]',
+    'main [aria-controls]'
+  ].join(", ");
+
+  const ACTIVITY_PANEL_SELECTOR = [
+    '[data-testid="screen-threadFlyOut"]',
+    'section[aria-label="Reasoning details"]',
+    '[role="dialog"][aria-modal="true"]',
+    '[data-testid*="cot" i]',
+    '[class*="content-sheet" i]'
+  ].join(", ");
+
+  const ACTIVITY_MARKDOWN_SELECTOR = [
+    ".markdown",
+    '[class*="markdown"]',
+    '[data-start][data-end]'
+  ].join(", ");
+
+  const ACTIVITY_TITLE_SELECTOR = [
+    '[class*="text-token-text-primary"]',
+    '[data-testid*="title" i]',
+    "h3",
+    "h4"
+  ].join(", ");
+
   let shell = null;
   let screenCanvas = null;
   let gl = null;
@@ -119,12 +168,30 @@
 
   let syncTimer = null;
   let renderQueued = false;
+  let renderLoopTimer = null;
   let resizeTimer = null;
   let sidebarLoadTimer = null;
   let sidebarAutoLoadBusy = false;
+  let dictateAudioStream = null;
+  let dictateAudioContext = null;
+  let dictateAnalyser = null;
+  let dictateAudioData = null;
+  let dictateFrame = null;
+  let dictatePulses = [];
+  let dictateLastPulse = 0;
+  let dictateLastAmplitude = 0;
+  let inlineDraftSyncTimer = null;
+  let dictateTranscriptToken = 0;
+  let dictateBaselineDraft = "";
+  let dictateSessionSource = null;
+  let dictateDetectionSuppressUntil = 0;
+  let dictateNativeConfirmed = false;
+  let dictateNativeMissingSince = 0;
 
   let movedComposer = null;
   let composerPlaceholder = null;
+  let composerOriginalParent = null;
+  let composerOriginalStyle = null;
   const boundNativePromptSync = new WeakSet();
 
   const state = {
@@ -139,7 +206,8 @@
       sidebar: false,
       thinking: false,
       chatbox: false,
-      model: false
+      model: false,
+      dictate: false
     },
     lastMessagesHash: "",
     renderCache: {
@@ -271,9 +339,30 @@
         --oracle-amber-strong: ${COLORS.amberStrong};
         --oracle-amber-dim: ${COLORS.amberDim};
         --oracle-amber-deep: ${COLORS.amberDeep};
+        --oracle-answer: ${COLORS.answer};
+        --oracle-answer-hot: ${COLORS.answerHot};
         --oracle-red: ${COLORS.red};
         --oracle-black: ${COLORS.black};
         --oracle-select: ${COLORS.select};
+        --oracle-highlight-fill:
+          linear-gradient(
+            90deg,
+            rgba(102, 48, 0, 0.18) 0%,
+            rgba(102, 48, 0, 0) 4%,
+            rgba(102, 48, 0, 0) 96%,
+            rgba(102, 48, 0, 0.18) 100%
+          ),
+          linear-gradient(
+            180deg,
+            #e5ad08 0%,
+            #f3bf08 20%,
+            #ffcf03 50%,
+            #f3bf08 80%,
+            #e5ad08 100%
+          );
+        --oracle-highlight-shadow:
+          0 0 2px rgba(255, 207, 3, 0.92),
+          0 0 12px rgba(255, 154, 0, 0.48);
       }
 
       html.${ROOT_CLASS},
@@ -325,7 +414,7 @@
         inset: 0;
         z-index: 2147483001;
         background: #000;
-        color: var(--oracle-amber);
+        color: var(--oracle-answer);
       }
 
       #${ROOT_ID}.${STANDBY_CLASS} {
@@ -522,7 +611,7 @@
         border: 0 !important;
         outline: 0 !important;
         background: #000 !important;
-        color: var(--oracle-amber-hot) !important;
+        color: var(--oracle-answer-hot) !important;
         padding: 4px 10px;
         cursor: pointer;
         white-space: nowrap;
@@ -543,15 +632,16 @@
       }
 
       .oracle-v14-btn:hover {
-        background: var(--oracle-amber-hot) !important;
-        color: #000 !important;
+        background: var(--oracle-highlight-fill) !important;
+        color: #090400 !important;
+        box-shadow: var(--oracle-highlight-shadow) !important;
         text-shadow: none !important;
       }
 
       .oracle-v14-popup {
         position: absolute;
         background: #000;
-        color: var(--oracle-amber);
+        color: var(--oracle-answer);
         z-index: 100;
         display: none;
         overflow: hidden;
@@ -574,11 +664,11 @@
         line-height: 22px;
         overflow: hidden;
         white-space: nowrap;
-        color: var(--oracle-amber-hot);
+        color: var(--oracle-answer);
         text-shadow:
           0 0 1px rgba(255, 218, 104, 1),
-          0 0 8px rgba(237, 162, 39, 0.95),
-          0 0 20px rgba(224, 137, 1, 0.62);
+          0 0 9px rgba(255, 177, 79, 0.95),
+          0 0 22px rgba(239, 123, 20, 0.62);
       }
 
       .oracle-v14-popup::after {
@@ -591,7 +681,7 @@
         line-height: 20px;
         overflow: hidden;
         white-space: nowrap;
-        color: var(--oracle-amber-dim);
+        color: var(--oracle-answer);
       }
 
       .oracle-v14-popup-body {
@@ -600,9 +690,19 @@
         overflow: auto;
         white-space: pre-wrap;
         line-height: 1.45;
-        color: var(--oracle-amber);
+        color: var(--oracle-answer);
+        text-shadow:
+          0 0 1px rgba(255, 217, 134, 0.95),
+          0 0 6px rgba(239, 161, 58, 0.88),
+          0 0 16px rgba(239, 123, 20, 0.54),
+          0 0 28px rgba(184, 72, 0, 0.24),
+          0 0 36px rgba(184, 72, 0, 0.12);
         scrollbar-width: thin;
-        scrollbar-color: var(--oracle-amber-hot) #000;
+        scrollbar-color: var(--oracle-answer) #000;
+      }
+
+      .oracle-v14-popup-body * {
+        text-shadow: inherit !important;
       }
 
       .oracle-v14-popup-body::-webkit-scrollbar {
@@ -611,7 +711,7 @@
       }
 
       .oracle-v14-popup-body::-webkit-scrollbar-thumb {
-        background: var(--oracle-amber-hot);
+        background: var(--oracle-answer);
         border: 2px solid #000;
       }
 
@@ -619,11 +719,32 @@
         background: #000;
       }
 
+      #oracle-v14-sidebar-popup,
+      #oracle-v14-thinking-popup,
+      #oracle-v14-chatbox-popup,
+      #oracle-v14-model-popup,
+      #oracle-v14-dictate-popup {
+        border-radius: 16px;
+        clip-path: inset(0.5px round 16px);
+        backface-visibility: hidden;
+        transform-style: preserve-3d;
+        background:
+          radial-gradient(ellipse at center, #050200 0%, #020100 66%, #000 100%);
+        box-shadow:
+          inset 0 16px 28px rgba(255, 177, 79, 0.035),
+          inset 0 -22px 34px rgba(0, 0, 0, 0.82),
+          inset 20px 0 30px rgba(0, 0, 0, 0.58),
+          inset -20px 0 30px rgba(0, 0, 0, 0.58),
+          0 0 0 1px rgba(239, 161, 58, 0.16);
+      }
+
       #oracle-v14-sidebar-popup {
         left: 28px;
         top: 28px;
         width: 360px;
         height: 65vh;
+        transform: perspective(600px) rotateY(-2.8deg) rotateX(0.85deg) scale(0.974);
+        transform-origin: left center;
       }
 
       #oracle-v14-thinking-popup {
@@ -631,12 +752,15 @@
         top: 28px;
         width: 420px;
         height: 65vh;
+        transform: perspective(600px) rotateY(2.8deg) rotateX(0.85deg) scale(0.974);
+        transform-origin: right center;
       }
 
       #oracle-v14-chatbox-popup {
         left: 50%;
         top: 50%;
-        transform: translate(-50%, -50%);
+        transform: translate(-50%, -50%) perspective(680px) rotateX(1.15deg) scale(0.976);
+        transform-origin: center center;
         width: min(920px, 88vw);
         height: min(320px, 44vh);
       }
@@ -644,10 +768,98 @@
       #oracle-v14-model-popup {
         left: 50%;
         bottom: 54px;
-        transform: translateX(-50%);
+        transform: translateX(-50%) perspective(650px) rotateX(1.25deg) scale(0.974);
+        transform-origin: center bottom;
         width: min(560px, 86vw);
         height: min(420px, 48vh);
         top: auto;
+      }
+
+      #oracle-v14-dictate-popup {
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%) perspective(580px) rotateX(1.9deg) scale(0.968);
+        transform-origin: center center;
+        width: min(288px, calc(100vw - 20px));
+        height: min(334px, calc(100vh - 64px));
+      }
+
+      .oracle-v14-dictate-ui {
+        min-height: 100%;
+        display: flex;
+        flex-direction: column;
+        justify-content: flex-start;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .oracle-v14-dictate-matrix {
+        width: min(242px, calc(100vw - 46px));
+        aspect-ratio: 1;
+        display: grid;
+        grid-template-columns: repeat(11, minmax(0, 1fr));
+        gap: 1px;
+      }
+
+      .oracle-v14-dictate-cell {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 0;
+        min-height: 0;
+        border: 1px solid rgba(234, 133, 1, 0.28);
+        color: var(--oracle-answer);
+        background: rgba(234, 133, 1, 0.05);
+        font-size: 15px;
+        line-height: 1;
+        text-shadow: none !important;
+      }
+
+      .oracle-v14-dictate-cell.on {
+        color: var(--oracle-answer-hot);
+        background: rgba(255, 177, 79, 0.14);
+        border-color: rgba(255, 177, 79, 0.55);
+        text-shadow:
+          0 0 1px rgba(255, 217, 134, 0.95),
+          0 0 6px rgba(239, 161, 58, 0.88),
+          0 0 16px rgba(239, 123, 20, 0.54) !important;
+      }
+
+      .oracle-v14-dictate-controls {
+        width: 100%;
+        display: flex;
+        justify-content: center;
+        gap: 18px;
+      }
+
+      .oracle-v14-dictate-control {
+        border: 0 !important;
+        outline: 0 !important;
+        background: #000 !important;
+        color: var(--oracle-answer) !important;
+        cursor: pointer;
+        padding: 3px 10px;
+        text-shadow:
+          0 0 1px rgba(255, 217, 134, 0.95),
+          0 0 6px rgba(239, 161, 58, 0.88),
+          0 0 16px rgba(239, 123, 20, 0.54);
+      }
+
+      .oracle-v14-dictate-control::before {
+        content: "[";
+        color: var(--oracle-answer);
+      }
+
+      .oracle-v14-dictate-control::after {
+        content: "]";
+        color: var(--oracle-answer);
+      }
+
+      .oracle-v14-dictate-control:hover {
+        background: var(--oracle-highlight-fill) !important;
+        color: #090400 !important;
+        box-shadow: var(--oracle-highlight-shadow) !important;
+        text-shadow: none !important;
       }
 
       .oracle-v14-model-option {
@@ -656,30 +868,33 @@
         border: 0 !important;
         outline: 0 !important;
         background: #000 !important;
-        color: var(--oracle-amber-hot) !important;
+        color: var(--oracle-answer) !important;
         text-align: left;
         padding: 7px 0;
         cursor: pointer;
         white-space: pre-wrap;
         text-shadow:
-          0 0 1px rgba(255, 202, 70, 0.95),
-          0 0 5px rgba(224, 137, 1, 0.82),
-          0 0 13px rgba(224, 100, 0, 0.45);
+          0 0 1px rgba(255, 217, 134, 0.95),
+          0 0 6px rgba(239, 161, 58, 0.88),
+          0 0 16px rgba(239, 123, 20, 0.54),
+          0 0 28px rgba(184, 72, 0, 0.24),
+          0 0 36px rgba(184, 72, 0, 0.12);
       }
 
       .oracle-v14-model-option:hover {
-        background: var(--oracle-amber-hot) !important;
-        color: #000 !important;
+        background: var(--oracle-highlight-fill) !important;
+        color: #090400 !important;
+        box-shadow: var(--oracle-highlight-shadow) !important;
         text-shadow: none !important;
       }
 
       .oracle-v14-model-option.current::before {
         content: "> ";
-        color: var(--oracle-select);
+        color: var(--oracle-answer);
       }
 
       .oracle-v14-model-status {
-        color: var(--oracle-amber-dim);
+        color: var(--oracle-answer);
         margin-bottom: 10px;
       }
 
@@ -689,28 +904,29 @@
         border: 0 !important;
         outline: 0 !important;
         background: #000 !important;
-        color: var(--oracle-amber-hot) !important;
+        color: var(--oracle-answer) !important;
         text-align: left;
         padding: 4px 0;
         cursor: pointer;
       }
 
       .oracle-v14-link-btn:hover {
-        background: var(--oracle-amber-hot) !important;
-        color: #000 !important;
+        background: var(--oracle-highlight-fill) !important;
+        color: #090400 !important;
+        box-shadow: var(--oracle-highlight-shadow) !important;
         text-shadow: none !important;
       }
 
       .oracle-v14-line-head {
-        color: var(--oracle-amber-hot);
+        color: var(--oracle-answer);
       }
 
       .oracle-v14-line-user {
-        color: var(--oracle-red);
+        color: var(--oracle-answer);
       }
 
       .oracle-v14-empty {
-        color: var(--oracle-amber-deep);
+        color: var(--oracle-answer);
       }
 
       .oracle-v14-native-composer {
@@ -732,11 +948,13 @@
       .oracle-v14-native-composer,
       .oracle-v14-native-composer *:not(pre):not(code):not(kbd):not(samp) {
         font-family: var(--oracle-font) !important;
-        color: var(--oracle-amber-hot) !important;
+        color: var(--oracle-answer) !important;
         text-shadow:
-          0 0 1px rgba(255, 202, 70, 0.95),
-          0 0 5px rgba(224, 137, 1, 0.82),
-          0 0 13px rgba(224, 100, 0, 0.45) !important;
+          0 0 1px rgba(255, 217, 134, 0.95),
+          0 0 6px rgba(239, 161, 58, 0.88),
+          0 0 16px rgba(239, 123, 20, 0.54),
+          0 0 28px rgba(184, 72, 0, 0.24),
+          0 0 36px rgba(184, 72, 0, 0.12) !important;
       }
 
       .oracle-v14-native-composer * {
@@ -745,8 +963,8 @@
 
       .oracle-v14-native-composer :where(textarea, input, [contenteditable="true"], #prompt-textarea) {
         background: #000 !important;
-        color: var(--oracle-amber-hot) !important;
-        caret-color: var(--oracle-amber-hot) !important;
+        color: var(--oracle-answer) !important;
+        caret-color: var(--oracle-select) !important;
         border: 0 !important;
         outline: 0 !important;
         box-shadow: none !important;
@@ -754,20 +972,21 @@
 
       .oracle-v14-native-composer :where(button, [role="button"]) {
         background: #000 !important;
-        color: var(--oracle-amber-hot) !important;
+        color: var(--oracle-answer) !important;
         border: 0 !important;
         box-shadow: none !important;
       }
 
       .oracle-v14-native-composer :where(button:hover, [role="button"]:hover) {
-        background: var(--oracle-amber-hot) !important;
-        color: #000 !important;
+        background: var(--oracle-highlight-fill) !important;
+        color: #090400 !important;
+        box-shadow: var(--oracle-highlight-shadow) !important;
         text-shadow: none !important;
       }
 
       .oracle-v14-native-composer svg,
       .oracle-v14-native-composer svg * {
-        color: var(--oracle-amber-hot) !important;
+        color: var(--oracle-answer) !important;
         stroke: currentColor !important;
       }
     `;
@@ -809,6 +1028,10 @@
         </div>
       </div>
 
+      <div id="oracle-v14-dictate-popup" class="oracle-v14-popup" data-title="DICTATE">
+        <div class="oracle-v14-popup-body" id="oracle-v14-dictate-body"></div>
+      </div>
+
       <div class="oracle-v14-bottom-bar">
         <button class="oracle-v14-btn" data-action="sidebar">SIDEBAR</button>
         <button class="oracle-v14-btn" data-action="thinking">THINKING</button>
@@ -839,7 +1062,7 @@
     const focusTerminal = () => {
       const selectedText = String(window.getSelection ? window.getSelection().toString() : "").trim();
       if (selectedText) return;
-      focusInlineInput();
+      focusInlineInput(true);
     };
 
     main.addEventListener("wheel", onMainWheel, { passive: false });
@@ -871,6 +1094,7 @@
 
     input.addEventListener("input", () => {
       syncInlineInputState();
+      scheduleInlineDraftToNative();
     });
 
     input.addEventListener("keydown", (event) => {
@@ -956,6 +1180,30 @@
     return true;
   }
 
+  function syncInlineDraftToNative(force = false) {
+    if (!force && (!state.shellOn || state.popup.chatbox || state.popup.dictate)) {
+      return false;
+    }
+
+    const prompt = getDockedNativePrompt() || findNativePromptOutsideShell();
+    if (!prompt) return false;
+
+    bindNativePromptDraftSync(prompt);
+
+    const value = readInlineDraft();
+    if (readPromptValue(prompt) === value) return true;
+
+    return setNativePromptValue(value, { preserveInlineFocus: true });
+  }
+
+  function scheduleInlineDraftToNative(delay = 70) {
+    clearTimeout(inlineDraftSyncTimer);
+    inlineDraftSyncTimer = setTimeout(() => {
+      inlineDraftSyncTimer = null;
+      syncInlineDraftToNative(false);
+    }, delay);
+  }
+
   function readInlineDraft() {
     const input = getInlineInput();
     return input ? (input.value || "") : "";
@@ -1002,7 +1250,7 @@
     boundNativePromptSync.add(prompt);
 
     const handler = () => {
-      if (!state.popup.chatbox) return;
+      if (!state.popup.chatbox && !state.popup.dictate) return;
 
       const value = readPromptValue(prompt);
       setInlineDraftValue(value, true);
@@ -1042,6 +1290,12 @@
 
     bind("thinking", () => {
       state.popup.thinking = !state.popup.thinking;
+
+      if (state.popup.thinking) {
+        forceOpenThinking();
+        collectData();
+      }
+
       updatePopups();
       refreshThinkingPopup();
       scheduleSync(40);
@@ -1078,7 +1332,7 @@
     });
 
     bind("dictate", () => {
-      triggerOriginalDictate();
+      toggleDictatePopup();
     });
 
     bind("model", () => {
@@ -1107,14 +1361,7 @@
 
         if (prompt) {
           bindNativePromptDraftSync(prompt);
-
-          const nativeDraft = readPromptValue(prompt);
-
-          if (inlineDraft || !nativeDraft) {
-            setNativePromptValue(inlineDraft);
-          } else {
-            setInlineDraftValue(nativeDraft, true);
-          }
+          setNativePromptValue(inlineDraft);
         }
 
         if (docked) {
@@ -1143,7 +1390,8 @@
       sidebar: "oracle-v14-sidebar-popup",
       thinking: "oracle-v14-thinking-popup",
       chatbox: "oracle-v14-chatbox-popup",
-      model: "oracle-v14-model-popup"
+      model: "oracle-v14-model-popup",
+      dictate: "oracle-v14-dictate-popup"
     };
 
     Object.entries(map).forEach(([key, id]) => {
@@ -1221,17 +1469,46 @@
     });
   }
   function disableShell() {
+    const wasEnabled = document.documentElement.classList.contains(ROOT_CLASS);
+
+    clearTimeout(inlineDraftSyncTimer);
+    inlineDraftSyncTimer = null;
+
+    if (!wasEnabled) {
+      syncNativeDraftToInline(true);
+    } else if (
+      state.popup.chatbox ||
+      state.popup.dictate ||
+      detectNativeDictateState().active
+    ) {
+      syncNativeDraftToInline(true);
+    } else {
+      syncInlineDraftToNative(true);
+    }
+
+    const input = getInlineInput();
+    if (input) {
+      try { input.blur(); } catch (_) {}
+    }
+
+    state.inputFocused = false;
     restoreNativeComposer();
 
     state.popup.sidebar = false;
     state.popup.thinking = false;
     state.popup.chatbox = false;
     state.popup.model = false;
+    state.popup.dictate = false;
     state.popup.model = false;
     restoreNativeModelMenusSoftly();
+    stopDictateAudio();
+    dictateSessionSource = null;
+    dictateNativeConfirmed = false;
+    dictateNativeMissingSince = 0;
     updatePopups();
 
     document.documentElement.classList.remove(ROOT_CLASS);
+    clearTimeout(renderLoopTimer);
 
     if (shell) {
       shell.hidden = false;
@@ -1243,6 +1520,10 @@
   }
 
   function enableShell() {
+    const nativeDictateState = detectNativeDictateState();
+
+    syncNativeDraftToInline(true);
+    state.inputFocused = false;
     document.documentElement.classList.add(ROOT_CLASS);
 
     if (shell) {
@@ -1253,6 +1534,23 @@
     state.shellOn = true;
     setBool(STORE_ON, true);
     updateToggleButtonLabel();
+
+    if (nativeDictateState.active && performance.now() >= dictateDetectionSuppressUntil) {
+      adoptNativeDictateState(nativeDictateState);
+    }
+
+    setTimeout(() => {
+      if (!state.shellOn || state.popup.dictate) return;
+
+      const delayedDictateState = detectNativeDictateState();
+      if (
+        delayedDictateState.active &&
+        performance.now() >= dictateDetectionSuppressUntil
+      ) {
+        adoptNativeDictateState(delayedDictateState);
+      }
+    }, 320);
+
     scheduleSync(50);
     requestRender();
   }
@@ -1289,11 +1587,35 @@
     );
   }
 
-  function setNativePromptValue(value) {
+  function setNativePromptValue(value, options = {}) {
     const target = findNativePromptOutsideShell();
     if (!target) return false;
 
     const nextValue = value || "";
+    const inlineInput = getInlineInput();
+    const preserveInlineFocus = Boolean(
+      options.preserveInlineFocus && inlineInput && document.activeElement === inlineInput
+    );
+    const inlineSelectionStart = preserveInlineFocus ? inlineInput.selectionStart : null;
+    const inlineSelectionEnd = preserveInlineFocus ? inlineInput.selectionEnd : null;
+
+    const restoreInlineFocus = () => {
+      if (!preserveInlineFocus) return;
+
+      try {
+        inlineInput.focus({ preventScroll: true });
+      } catch (_) {
+        try { inlineInput.focus(); } catch (_) {}
+      }
+
+      try {
+        const max = inlineInput.value.length;
+        inlineInput.selectionStart = Math.max(0, Math.min(max, inlineSelectionStart ?? max));
+        inlineInput.selectionEnd = Math.max(0, Math.min(max, inlineSelectionEnd ?? max));
+      } catch (_) {}
+
+      syncInlineInputState();
+    };
 
     try {
       target.focus();
@@ -1315,6 +1637,7 @@
       target.dispatchEvent(new Event("input", { bubbles: true }));
       target.dispatchEvent(new Event("change", { bubbles: true }));
       bindNativePromptDraftSync(target);
+      restoreInlineFocus();
       return true;
     }
 
@@ -1344,9 +1667,11 @@
 
       target.dispatchEvent(new Event("change", { bubbles: true }));
       bindNativePromptDraftSync(target);
+      restoreInlineFocus();
       return true;
     }
 
+    restoreInlineFocus();
     return false;
   }
 
@@ -1364,6 +1689,8 @@
 
     if (!isMine(composer)) {
       if (!composerPlaceholder && composer.parentNode) {
+        composerOriginalParent = composer.parentNode;
+        composerOriginalStyle = composer.getAttribute("style");
         composerPlaceholder = document.createComment("oracle-v14-composer-placeholder");
         composer.parentNode.insertBefore(composerPlaceholder, composer);
       }
@@ -1415,7 +1742,24 @@
 
     if (composerPlaceholder && composerPlaceholder.parentNode) {
       composerPlaceholder.parentNode.insertBefore(composer, composerPlaceholder);
+    } else if (composerOriginalParent && composerOriginalParent.isConnected) {
+      composerOriginalParent.appendChild(composer);
     }
+
+    if (composerOriginalStyle === null) {
+      composer.removeAttribute("style");
+    } else {
+      composer.setAttribute("style", composerOriginalStyle);
+    }
+
+    if (composerPlaceholder && composerPlaceholder.parentNode) {
+      composerPlaceholder.remove();
+    }
+
+    movedComposer = null;
+    composerPlaceholder = null;
+    composerOriginalParent = null;
+    composerOriginalStyle = null;
   }
 
   function isSendCandidate(el) {
@@ -1560,8 +1904,236 @@
     return false;
   }
 
+  function getDictateBody() {
+    return document.getElementById("oracle-v14-dictate-body");
+  }
+
+  function ensureDictatePopupBody() {
+    const body = getDictateBody();
+    if (!body) return null;
+
+    if (body.querySelector(".oracle-v14-dictate-matrix")) return body;
+
+    body.textContent = "";
+
+    const ui = document.createElement("div");
+    ui.className = "oracle-v14-dictate-ui";
+
+    const matrix = document.createElement("div");
+    matrix.className = "oracle-v14-dictate-matrix";
+
+    for (let i = 0; i < DICTATE_MATRIX_SIZE * DICTATE_MATRIX_SIZE; i += 1) {
+      const cell = document.createElement("div");
+      cell.className = "oracle-v14-dictate-cell";
+      cell.dataset.index = String(i);
+      cell.textContent = "0";
+      matrix.appendChild(cell);
+    }
+
+    const controls = document.createElement("div");
+    controls.className = "oracle-v14-dictate-controls";
+
+    const pauseBtn = document.createElement("button");
+    pauseBtn.type = "button";
+    pauseBtn.className = "oracle-v14-dictate-control";
+    pauseBtn.textContent = "CANCEL";
+    pauseBtn.addEventListener("click", () => {
+      clickOriginalDictatePause();
+    });
+
+    const finishBtn = document.createElement("button");
+    finishBtn.type = "button";
+    finishBtn.className = "oracle-v14-dictate-control";
+    finishBtn.textContent = "FINISH";
+    finishBtn.addEventListener("click", () => {
+      clickOriginalDictateSend();
+    });
+
+    controls.appendChild(pauseBtn);
+    controls.appendChild(finishBtn);
+
+    ui.appendChild(matrix);
+    ui.appendChild(controls);
+    body.appendChild(ui);
+
+    return body;
+  }
+
+  function setDictateStatus(text) {
+    const popup = document.getElementById("oracle-v14-dictate-popup");
+    if (!popup) return;
+
+    const status = String(text || "");
+    let titleStatus = "";
+
+    if (/paused/i.test(status)) titleStatus = "PAUSED";
+    else if (/listening|recording/i.test(status)) titleStatus = "RECORDING";
+    else if (/starting|start sent|waiting/i.test(status)) titleStatus = "STARTING";
+    else if (/failed|not available|not confirmed|state lost|error/i.test(status)) titleStatus = "ERROR";
+    else if (/shortcut sent/i.test(status)) titleStatus = "FINISHING";
+
+    popup.dataset.status = status;
+    popup.dataset.title = titleStatus ? `DICTATE / ${titleStatus}` : "DICTATE";
+  }
+
+  function updateDictateMatrix(activeCells = new Set()) {
+    const body = ensureDictatePopupBody();
+    if (!body) return;
+
+    body.querySelectorAll(".oracle-v14-dictate-cell").forEach((cell) => {
+      const on = activeCells.has(Number(cell.dataset.index || 0));
+      cell.classList.toggle("on", on);
+      cell.textContent = on ? "1" : "0";
+    });
+  }
+
+  function buildDictateWaveCells(now) {
+    const active = new Set();
+    const center = (DICTATE_MATRIX_SIZE - 1) / 2;
+
+    dictatePulses = dictatePulses.filter((pulse) => now - pulse.time < 1200);
+
+    dictatePulses.forEach((pulse) => {
+      const age = (now - pulse.time) / 1000;
+      const radius = age * (5.4 + pulse.strength * 4.2);
+      const band = 0.48 + pulse.strength * 0.55;
+
+      for (let row = 0; row < DICTATE_MATRIX_SIZE; row += 1) {
+        for (let col = 0; col < DICTATE_MATRIX_SIZE; col += 1) {
+          const dist = Math.hypot(row - center, col - center);
+          const isCenterPulse = radius < 0.55 && dist < 0.8;
+          const isRing = Math.abs(dist - radius) <= band;
+
+          if (isCenterPulse || isRing) {
+            active.add(row * DICTATE_MATRIX_SIZE + col);
+          }
+        }
+      }
+    });
+
+    return active;
+  }
+
+  function getDictateAmplitude() {
+    if (!dictateAnalyser || !dictateAudioData) return 0;
+
+    dictateAnalyser.getByteTimeDomainData(dictateAudioData);
+
+    let sum = 0;
+    for (let i = 0; i < dictateAudioData.length; i += 1) {
+      const v = (dictateAudioData[i] - 128) / 128;
+      sum += v * v;
+    }
+
+    return Math.min(1, Math.sqrt(sum / dictateAudioData.length) * 3.6);
+  }
+
+  function animateDictateMatrix() {
+    if (!state.popup.dictate) return;
+
+    const now = performance.now();
+    const level = getDictateAmplitude();
+    const rising = level > dictateLastAmplitude + 0.018;
+
+    if (level > 0.075 && (rising || now - dictateLastPulse > 260)) {
+      dictatePulses.push({
+        time: now,
+        strength: level
+      });
+      dictateLastPulse = now;
+    }
+
+    dictateLastAmplitude = level * 0.72 + dictateLastAmplitude * 0.28;
+    updateDictateMatrix(buildDictateWaveCells(now), level);
+    dictateFrame = requestAnimationFrame(animateDictateMatrix);
+  }
+
+  function stopDictateAudio() {
+    if (dictateFrame) {
+      cancelAnimationFrame(dictateFrame);
+      dictateFrame = null;
+    }
+
+    if (dictateAudioStream) {
+      dictateAudioStream.getTracks().forEach((track) => track.stop());
+    }
+
+    if (dictateAudioContext) {
+      try { dictateAudioContext.close(); } catch (_) {}
+    }
+
+    dictateAudioStream = null;
+    dictateAudioContext = null;
+    dictateAnalyser = null;
+    dictateAudioData = null;
+    dictatePulses = [];
+    dictateLastPulse = 0;
+    dictateLastAmplitude = 0;
+  }
+
+  function startDictateAudio() {
+    stopDictateAudio();
+    updateDictateMatrix(new Set(), 0, "WAITING FOR VOICE INPUT");
+    setDictateStatus("WAITING FOR VOICE INPUT");
+
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function") {
+      setDictateStatus("MICROPHONE API NOT AVAILABLE");
+      return false;
+    }
+
+    navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
+      if (!state.popup.dictate) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+
+      const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+
+      if (!AudioContextCtor) {
+        stream.getTracks().forEach((track) => track.stop());
+        setDictateStatus("WEB AUDIO API NOT AVAILABLE");
+        return;
+      }
+
+      dictateAudioStream = stream;
+      dictateAudioContext = new AudioContextCtor();
+      dictateAnalyser = dictateAudioContext.createAnalyser();
+      dictateAnalyser.fftSize = 512;
+      dictateAnalyser.smoothingTimeConstant = 0.72;
+      dictateAudioData = new Uint8Array(dictateAnalyser.fftSize);
+
+      if (dictateAudioContext.state === "suspended") {
+        dictateAudioContext.resume().catch(() => {});
+      }
+
+      const source = dictateAudioContext.createMediaStreamSource(stream);
+      source.connect(dictateAnalyser);
+
+      setDictateStatus("LISTENING FOR VOICE INPUT");
+      animateDictateMatrix();
+    }).catch(() => {
+      setDictateStatus("MICROPHONE ACCESS FAILED");
+    });
+
+    return true;
+  }
+
+  function findOriginalDictateButton() {
+    return engineQsAll(
+      'button[aria-label*="Dictate" i], [role="button"][aria-label*="Dictate" i], button[aria-label*="dictation" i], [role="button"][aria-label*="dictation" i], button[aria-label*="语音" i], [role="button"][aria-label*="语音" i]'
+    ).find((el) => el && !isMine(el) && !isDisabledControl(el) && isVisibleEnough(el));
+  }
+
   function triggerOriginalDictate() {
     if (state.popup.chatbox) dockNativeComposer();
+
+    const directBtn = findOriginalDictateButton();
+    if (directBtn) {
+      hardClick(directBtn);
+      return true;
+    }
+
+    return false;
 
     const btn = engineQsAll(
       'button[aria-label*="Dictate" i], [role="button"][aria-label*="Dictate" i], button[aria-label*="dictation" i], [role="button"][aria-label*="dictation" i], button[aria-label*="语音" i], [role="button"][aria-label*="语音" i]'
@@ -1575,7 +2147,372 @@
     return false;
   }
 
+  function findOriginalDictateControl(kind) {
+    const pauseSelector = [
+      'button[aria-label*="Pause" i]',
+      '[role="button"][aria-label*="Pause" i]',
+      'button[aria-label*="Resume" i]',
+      '[role="button"][aria-label*="Resume" i]',
+      'button[aria-label*="暂停" i]',
+      '[role="button"][aria-label*="暂停" i]',
+      'button[aria-label*="继续" i]',
+      '[role="button"][aria-label*="继续" i]'
+    ].join(", ");
+
+    const sendSelector = [
+      '[data-testid="send-button"]',
+      '[data-testid="composer-submit-button"]',
+      'button[data-testid*="send" i]',
+      'button[data-testid*="submit" i]',
+      'button[aria-label*="Send" i]',
+      '[role="button"][aria-label*="Send" i]',
+      'button[aria-label*="发送" i]',
+      '[role="button"][aria-label*="发送" i]',
+      'button[type="submit"]'
+    ].join(", ");
+
+    const selector = kind === "pause" ? pauseSelector : sendSelector;
+
+    return engineQsAll(selector).find((el) => {
+      if (!el || isMine(el)) return false;
+      if (isDisabledControl(el)) return false;
+      if (!isVisibleEnough(el)) return false;
+
+      const label = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("data-testid") || ""} ${txt(el)}`;
+      if (kind === "send" && /stop|cancel|pause|resume/i.test(label)) return false;
+      if (kind === "pause" && /send|submit/i.test(label)) return false;
+
+      return true;
+    });
+  }
+
+  function detectNativeDictateState() {
+    const candidates = engineQsAll(
+      [
+        '[data-testid*="dictat" i]',
+        '[data-testid*="record" i]',
+        '[data-testid*="speech" i]',
+        '[aria-label*="dictat" i]',
+        '[aria-label*="recording" i]',
+        '[aria-label*="listening" i]',
+        'button[aria-label*="Pause" i]',
+        'button[aria-label*="Resume" i]',
+        'button[aria-label*="暂停" i]',
+        'button[aria-label*="继续" i]'
+      ].join(", ")
+    ).filter((el) => {
+      if (!el) return false;
+      if (isMine(el) && !el.closest(".oracle-v14-native-composer")) return false;
+
+      const style = window.getComputedStyle(el);
+      return style.display !== "none" && hasRectSize(el);
+    });
+
+    let paused = false;
+    let activeNode = null;
+
+    for (const el of candidates) {
+      const context = el.closest('[data-testid], [role="dialog"], form') || el.parentElement;
+      const signature = [
+        el.getAttribute("aria-label") || "",
+        el.getAttribute("data-testid") || "",
+        el.getAttribute("data-state") || "",
+        el.getAttribute("aria-pressed") || "",
+        el.className || "",
+        context && context !== el ? context.getAttribute("data-testid") || "" : "",
+        context && context !== el ? context.getAttribute("aria-label") || "" : "",
+        getElementTextForModel(el).slice(0, 180)
+      ].join(" ").toLowerCase();
+
+      const explicitState = /(recording|listening|dictating|capturing|录音中|正在聆听|正在听写)/i.test(signature);
+      const pressed = el.getAttribute("aria-pressed") === "true";
+      const openDictateControl =
+        /(dictat|record|speech|microphone|听写|录音|语音)/i.test(signature) &&
+        /\b(open|active|recording|listening)\b/i.test(el.getAttribute("data-state") || "");
+      const explicitAction =
+        /(?:pause|resume|finish|cancel|stop).*(?:dictat|record|speech)/i.test(signature) ||
+        /(?:dictat|record|speech).*(?:pause|resume|finish|cancel|stop)/i.test(signature);
+
+      if (explicitState || pressed || openDictateControl || explicitAction) {
+        activeNode = el;
+        paused = /resume|继续/i.test(signature);
+        break;
+      }
+    }
+
+    return {
+      active: Boolean(activeNode),
+      paused,
+      node: activeNode
+    };
+  }
+
+  function adoptNativeDictateState(nativeState = {}) {
+    const prompt = getDockedNativePrompt() || findNativePromptOutsideShell();
+    const nativeDraft = prompt ? readPromptValue(prompt) : readInlineDraft();
+
+    if (prompt) bindNativePromptDraftSync(prompt);
+
+    dictateTranscriptToken += 1;
+    dictateBaselineDraft = nativeDraft;
+    dictateSessionSource = "native";
+    dictateNativeConfirmed = true;
+    dictateNativeMissingSince = 0;
+
+    setInlineDraftValue(nativeDraft, true);
+    state.popup.dictate = true;
+    updatePopups();
+    ensureDictatePopupBody();
+    updateDictateMatrix(new Set());
+    startDictateAudio();
+    setDictateStatus(nativeState.paused ? "NATIVE DICTATE PAUSED" : "NATIVE DICTATE RECORDING");
+  }
+
+  function confirmNativeDictateStarted(sessionToken, attempt = 0) {
+    if (
+      sessionToken !== dictateTranscriptToken ||
+      !state.popup.dictate ||
+      dictateSessionSource !== "script"
+    ) {
+      return false;
+    }
+
+    const nativeState = detectNativeDictateState();
+
+    if (nativeState.active) {
+      dictateNativeConfirmed = true;
+      dictateNativeMissingSince = 0;
+      startDictateAudio();
+      setDictateStatus(nativeState.paused ? "NATIVE DICTATE PAUSED" : "NATIVE DICTATE RECORDING");
+      return true;
+    }
+
+    if (attempt >= 12) {
+      dictateNativeConfirmed = false;
+      stopDictateAudio();
+      setDictateStatus("NATIVE DICTATE STATE NOT CONFIRMED");
+      return false;
+    }
+
+    setTimeout(() => {
+      confirmNativeDictateStarted(sessionToken, attempt + 1);
+    }, 180);
+
+    return false;
+  }
+
+  function dispatchDocumentShortcut(eventInit) {
+    const active = document.activeElement && document.activeElement !== document.body
+      ? document.activeElement
+      : (document.body || document);
+
+    ["keydown", "keyup"].forEach((type) => {
+      const event = new KeyboardEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        ...eventInit
+      });
+
+      active.dispatchEvent(event);
+    });
+
+    return true;
+  }
+
+  function mergeDictateTranscript(previousDraft, nativeDraft) {
+    const baseline = String(previousDraft || "");
+    const nativeValue = String(nativeDraft || "");
+
+    if (!baseline) return nativeValue;
+    if (!nativeValue) return baseline;
+
+    const baselineTrimmed = baseline.trim();
+
+    if (
+      nativeValue.startsWith(baseline) ||
+      (baselineTrimmed && nativeValue.trimStart().startsWith(baselineTrimmed))
+    ) {
+      return nativeValue;
+    }
+
+    const separator = /\s$/.test(baseline) || /^\s/.test(nativeValue) ? "" : " ";
+    return `${baseline}${separator}${nativeValue}`;
+  }
+
+  function syncDictateTranscriptBack(previousDraft = "") {
+    const token = ++dictateTranscriptToken;
+    const baseline = String(previousDraft || "");
+    let attempt = 0;
+    let latestNativeDraft = baseline;
+    let sawChange = false;
+    let lastChangeAt = performance.now();
+    const pollingStartedAt = lastChangeAt;
+
+    const commitLatestDraft = () => {
+      const mergedDraft = mergeDictateTranscript(baseline, latestNativeDraft);
+
+      setInlineDraftValue(mergedDraft, true);
+      state.data.draft = mergedDraft;
+
+      if (latestNativeDraft !== mergedDraft) {
+        setNativePromptValue(mergedDraft, { preserveInlineFocus: true });
+      }
+
+      dictateBaselineDraft = "";
+      requestRender();
+      scheduleSync(80);
+      return true;
+    };
+
+    const poll = () => {
+      if (token !== dictateTranscriptToken) return false;
+
+      attempt += 1;
+
+      const prompt = getDockedNativePrompt() || findNativePromptOutsideShell();
+      const nativeDraft = prompt ? readPromptValue(prompt) : "";
+      const now = performance.now();
+
+      if (nativeDraft && nativeDraft !== latestNativeDraft) {
+        latestNativeDraft = nativeDraft;
+        sawChange = nativeDraft !== baseline;
+        lastChangeAt = now;
+      }
+
+      if (
+        sawChange &&
+        now - lastChangeAt >= 720 &&
+        now - pollingStartedAt >= 1400
+      ) {
+        return commitLatestDraft();
+      }
+
+      if (attempt >= 30) {
+        if (sawChange) return commitLatestDraft();
+
+        dictateBaselineDraft = "";
+        scheduleSync(80);
+        requestRender();
+        return false;
+      }
+
+      setTimeout(poll, 220);
+      return false;
+    };
+
+    setTimeout(poll, 220);
+    return true;
+  }
+
+  function dispatchDictateShortcut() {
+    return dispatchDocumentShortcut({
+      key: "d",
+      code: "KeyD",
+      keyCode: 68,
+      which: 68,
+      ctrlKey: true,
+      shiftKey: true
+    });
+  }
+
+  function clickOriginalDictatePause() {
+    const baseline = dictateBaselineDraft || readInlineDraft();
+
+    dispatchDocumentShortcut({
+      key: "Escape",
+      code: "Escape",
+      keyCode: 27,
+      which: 27
+    });
+
+    setDictateStatus("ESC SHORTCUT SENT");
+    stopDictateAudio();
+    dictateTranscriptToken += 1;
+    dictateSessionSource = null;
+    dictateNativeConfirmed = false;
+    dictateNativeMissingSince = 0;
+    dictateDetectionSuppressUntil = performance.now() + 1400;
+    dictateBaselineDraft = "";
+    state.popup.dictate = false;
+    updatePopups();
+    setInlineDraftValue(baseline, true);
+
+    setTimeout(() => {
+      setNativePromptValue(baseline, { preserveInlineFocus: true });
+      scheduleSync(80);
+      requestRender();
+    }, 120);
+
+    return true;
+  }
+
+  function clickOriginalDictateSend() {
+    const beforeDraft = dictateBaselineDraft || readInlineDraft();
+
+    dispatchDictateShortcut();
+
+    setDictateStatus("CTRL+SHIFT+D SHORTCUT SENT");
+    stopDictateAudio();
+    dictateSessionSource = null;
+    dictateNativeConfirmed = false;
+    dictateNativeMissingSince = 0;
+    dictateDetectionSuppressUntil = performance.now() + 1800;
+    state.popup.dictate = false;
+    updatePopups();
+    setTimeout(() => {
+      syncDictateTranscriptBack(beforeDraft);
+    }, 260);
+    return true;
+  }
+
+  function toggleDictatePopup() {
+    const opening = !state.popup.dictate;
+
+    if (!opening) {
+      state.popup.dictate = false;
+      stopDictateAudio();
+      dictateSessionSource = null;
+      dictateNativeConfirmed = false;
+      dictateNativeMissingSince = 0;
+      updatePopups();
+      return;
+    }
+
+    const nativeDictateState = detectNativeDictateState();
+
+    if (nativeDictateState.active) {
+      adoptNativeDictateState(nativeDictateState);
+      return;
+    }
+
+    dictateTranscriptToken += 1;
+    const sessionToken = dictateTranscriptToken;
+    dictateBaselineDraft = readInlineDraft();
+    dictateSessionSource = "script";
+    dictateNativeConfirmed = false;
+    dictateNativeMissingSince = 0;
+
+    syncInlineDraftToNative(true);
+
+    state.popup.dictate = true;
+    updatePopups();
+    ensureDictatePopupBody();
+    updateDictateMatrix(new Set(), 0, "STARTING ORIGINAL DICTATE");
+    setDictateStatus("STARTING ORIGINAL DICTATE");
+
+    setTimeout(() => {
+      if (!state.popup.dictate || dictateSessionSource !== "script") return;
+
+      dispatchDictateShortcut();
+      setDictateStatus("CTRL+SHIFT+D DICTATE START SENT");
+      confirmNativeDictateStarted(sessionToken, 0);
+    }, 90);
+  }
+
   let hiddenNativeModelMenus = [];
+  let modelDiscoveryInFlight = false;
+  let modelDiscoveryToken = 0;
 
   function triggerOriginalModelSelect() {
     toggleModelPopup();
@@ -1608,12 +2545,13 @@
       clientY: y
     };
 
-    ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((type) => {
+    ["pointerdown", "mousedown", "pointerup", "mouseup"].forEach((type) => {
       try {
         el.dispatchEvent(new MouseEvent(type, eventInit));
       } catch (_) {}
     });
 
+    // Dispatch exactly one click. Toggle controls close again when clicked twice.
     try {
       el.click();
     } catch (_) {}
@@ -1879,6 +2817,8 @@
           '[role="button"][aria-haspopup="listbox"]',
           'button[data-testid*="model" i]',
           '[role="button"][data-testid*="model" i]',
+          'button[data-testid*="intelligence" i]',
+          '[role="button"][data-testid*="intelligence" i]',
           'button[aria-label*="model" i]',
           '[role="button"][aria-label*="model" i]',
           'button[aria-label*="模型" i]',
@@ -1905,10 +2845,12 @@
         const explicit =
           /(select model|switch model|model selector|model picker|choose model|选择模型|模型选择)/i.test(label) ||
           /model/i.test(el.getAttribute("data-testid") || "") ||
-          /model/i.test(el.getAttribute("aria-label") || "");
+          /model/i.test(el.getAttribute("aria-label") || "") ||
+          /intelligence|reasoning/i.test(el.getAttribute("data-testid") || "") ||
+          /intelligence|reasoning/i.test(el.getAttribute("aria-label") || "");
 
         const modelish =
-          /\b(gpt|o3|o4|4o|5\.5|5|thinking|instant|auto|fast|mini|pro)\b/i.test(label) ||
+          /\b(gpt|o3|o4|4o|5\.5|5|thinking|instant|medium|high|auto|fast|mini|pro)\b/i.test(label) ||
           /(模型|推理|快速)/i.test(label);
 
         if (!explicit && !modelish) return;
@@ -1936,6 +2878,8 @@
 
       if (/model/i.test(a.getAttribute("data-testid") || "")) ascore -= 700;
       if (/model/i.test(b.getAttribute("data-testid") || "")) bscore -= 700;
+      if (/intelligence|reasoning/i.test(a.getAttribute("data-testid") || "")) ascore -= 650;
+      if (/intelligence|reasoning/i.test(b.getAttribute("data-testid") || "")) bscore -= 650;
 
       if (promptRect) {
         const acx = (ar.left + ar.right) / 2;
@@ -1978,8 +2922,47 @@
     }
   }
 
+  function getDirectNativeMenuItems(menu) {
+    if (!menu) return [];
+
+    return qsAll(
+      '[role="menuitem"], [role="menuitemradio"], [role="option"], [role="radio"]',
+      menu
+    ).filter((item) => {
+      const owner = item.closest('[role="menu"], [role="listbox"]');
+      return owner === menu && !isDisabledControl(item);
+    });
+  }
+
+  function getNativeModelItemLabel(item) {
+    if (!item) return "";
+
+    const conciseText = item.querySelector(".truncate")?.textContent || "";
+
+    return normalizeModelLabel(
+      item.getAttribute("aria-label") || conciseText || getElementTextForModel(item)
+    );
+  }
+
+  function getControlledNativeMenu(trigger) {
+    if (!trigger) return null;
+
+    const controlledId = trigger.getAttribute("aria-controls");
+    const controlled = controlledId ? document.getElementById(controlledId) : null;
+
+    if (
+      controlled &&
+      controlled.matches('[role="menu"], [role="listbox"]') &&
+      hasRectSize(controlled, 20, 20)
+    ) {
+      return controlled;
+    }
+
+    return null;
+  }
+
   function getOpenNativeModelMenus() {
-    return engineQsAll(MODEL_MENU_SELECTOR)
+    return engineQsAll('[role="menu"], [role="listbox"]')
       .filter((el) => {
         if (!el) return false;
         if (isMine(el)) return false;
@@ -1995,6 +2978,174 @@
 
         return modelHits >= 1;
       });
+  }
+
+  function findPrimaryNativeModelMenu() {
+    const menus = getOpenNativeModelMenus();
+
+    return menus.find((menu) =>
+      menu.querySelector('[data-testid="composer-intelligence-picker-content"]')
+    ) || menus.find((menu) =>
+      /intelligence/i.test(getElementTextForModel(menu))
+    ) || menus[0] || null;
+  }
+
+  function findDirectNativeMenuItem(menu, wantedLabel) {
+    const wanted = normalizeModelLabel(wantedLabel).toLowerCase();
+    if (!menu || !wanted) return null;
+
+    return getDirectNativeMenuItems(menu).find((item) =>
+      getNativeModelItemLabel(item).toLowerCase() === wanted
+    ) || null;
+  }
+
+  function appendNativeModelMenuLayer(menu, parentPath, options, seen) {
+    const submenuEntries = [];
+    const menuText = getElementTextForModel(menu);
+
+    getDirectNativeMenuItems(menu).forEach((item) => {
+      const label = getNativeModelItemLabel(item);
+      if (!label || looksLikeRetryOrMessageAction(label)) return;
+
+      const hasSubmenu =
+        item.getAttribute("aria-haspopup") === "menu" ||
+        item.hasAttribute("data-has-submenu");
+
+      if (hasSubmenu) {
+        submenuEntries.push({
+          trigger: item,
+          path: parentPath.concat(label)
+        });
+        return;
+      }
+
+      const role = item.getAttribute("role") || "";
+      const isChoiceRole = /menuitemradio|option|radio/.test(role);
+
+      if (!parentPath.length && !isChoiceRole && !looksLikeModelOptionText(label)) return;
+
+      const actionPath = parentPath.concat(label);
+      const group = parentPath.length
+        ? parentPath.join(" > ")
+        : (/intelligence/i.test(menuText) && isChoiceRole ? "INTELLIGENCE" : "MODEL");
+      const displayLabel = group === "MODEL" ? label : `${group} > ${label}`;
+      const key = actionPath.join("\u0000").toLowerCase();
+
+      pushUniqueModelOption(options, seen, {
+        label: displayLabel,
+        actionLabel: label,
+        path: actionPath,
+        group,
+        current:
+          item.getAttribute("aria-checked") === "true" ||
+          item.getAttribute("aria-selected") === "true" ||
+          item.getAttribute("data-state") === "checked"
+      }, key);
+    });
+
+    return submenuEntries;
+  }
+
+  function discoverRealModelOptions(done) {
+    const rootMenu = findPrimaryNativeModelMenu();
+
+    if (!rootMenu) {
+      done([], { currentFamily: "" });
+      return;
+    }
+
+    const options = [];
+    const seen = new Set();
+    const visitedMenus = new Set([rootMenu]);
+    const rootSubmenus = appendNativeModelMenuLayer(rootMenu, [], options, seen);
+    const currentFamilyEntry = rootSubmenus.find((entry) =>
+      /\b(gpt|o3|o4|4o|5(?:\.\d+)?)\b/i.test(entry.path[0] || "")
+    );
+    const currentFamily = currentFamilyEntry ? currentFamilyEntry.path[0] : "";
+    const queue = rootSubmenus.map((entry) => ({ ...entry, depth: 1 }));
+
+    const visitNextSubmenu = () => {
+      const entry = queue.shift();
+
+      if (!entry) {
+        done(options.slice(0, 50), { currentFamily });
+        return;
+      }
+
+      const readOpenedSubmenu = () => {
+        const submenu = getControlledNativeMenu(entry.trigger);
+
+        if (submenu && !visitedMenus.has(submenu)) {
+          visitedMenus.add(submenu);
+
+          const nested = appendNativeModelMenuLayer(
+            submenu,
+            entry.path,
+            options,
+            seen
+          );
+
+          if (entry.depth < 2) {
+            nested.forEach((child) => {
+              queue.push({ ...child, depth: entry.depth + 1 });
+            });
+          }
+        }
+
+        visitNextSubmenu();
+      };
+
+      const alreadyOpen = getControlledNativeMenu(entry.trigger);
+
+      if (alreadyOpen) {
+        readOpenedSubmenu();
+        return;
+      }
+
+      hardClick(entry.trigger);
+      setTimeout(readOpenedSubmenu, 260);
+    };
+
+    visitNextSubmenu();
+  }
+
+  function clickNativeModelPath(menu, path, index, done) {
+    if (!menu || !Array.isArray(path) || index >= path.length) {
+      done(false);
+      return;
+    }
+
+    const item = findDirectNativeMenuItem(menu, path[index]);
+
+    if (!item) {
+      done(false);
+      return;
+    }
+
+    if (index === path.length - 1) {
+      hardClick(item);
+      done(true);
+      return;
+    }
+
+    const continueInSubmenu = () => {
+      const submenu = getControlledNativeMenu(item);
+
+      if (!submenu) {
+        done(false);
+        return;
+      }
+
+      clickNativeModelPath(submenu, path, index + 1, done);
+    };
+
+    if (getControlledNativeMenu(item)) {
+      continueInSubmenu();
+      return;
+    }
+
+    hardClick(item);
+    setTimeout(continueInSubmenu, 260);
   }
 
   function collectRealModelOptions() {
@@ -2183,43 +3334,65 @@
   }
 
   function refreshRealModelOptionsAfterOpen(source = "button") {
+    if (modelDiscoveryInFlight) return;
+
+    modelDiscoveryInFlight = true;
+    const discoveryToken = ++modelDiscoveryToken;
+
     restoreNativeModelMenusSoftly();
 
-    const options = collectRealModelOptions();
+    discoverRealModelOptions((options, metadata = {}) => {
+      if (discoveryToken !== modelDiscoveryToken) return;
 
-    state.data.modelOptions = options;
+      modelDiscoveryInFlight = false;
+      if (!state.popup.model) return;
 
-    if (!options.length) {
-      renderModelPopup(
-        source === "shortcut"
-          ? "REAL MODEL MENU WAS NOT DETECTED AFTER CTRL+SHIFT+M."
-          : "REAL MODEL MENU WAS NOT DETECTED. TRYING CTRL+SHIFT+M FALLBACK..."
-      );
+      state.data.modelOptions = options;
 
-      if (source !== "shortcut") {
-        dispatchModelShortcut();
+      if (!options.length) {
+        renderModelPopup(
+          source === "shortcut"
+            ? "REAL MODEL MENU WAS NOT DETECTED AFTER CTRL+SHIFT+M."
+            : "REAL MODEL MENU WAS NOT DETECTED. TRYING CTRL+SHIFT+M FALLBACK..."
+        );
 
-        setTimeout(() => {
-          refreshRealModelOptionsAfterOpen("shortcut");
-        }, 420);
+        if (source !== "shortcut") {
+          dispatchModelShortcut();
+
+          setTimeout(() => {
+            refreshRealModelOptionsAfterOpen("shortcut");
+          }, 420);
+        }
+
+        return;
       }
 
-      return;
-    }
+      const currentModel = options.find((option) =>
+        option.current && /\b(gpt|o3|o4|4o|5(?:\.\d+)?)\b/i.test(option.actionLabel || "")
+      );
 
-    renderModelPopup(`REAL MODEL OPTIONS DETECTED: ${options.length}`);
+      if (currentModel) {
+        state.data.modelLabel = currentModel.actionLabel;
+      } else if (metadata.currentFamily) {
+        state.data.modelLabel = metadata.currentFamily;
+      }
 
-    /*
-      Hide native menu from view, but keep it in the DOM.
-      We restore it before actually clicking.
-    */
-    hideNativeModelMenusSoftly();
+      const currentLabel = metadata.currentFamily || state.data.modelLabel || "MODEL";
+      renderModelPopup(`CURRENT MODEL: ${currentLabel} / OPTIONS: ${options.length}`);
+
+      /*
+        Hide native menus from view, but keep their current React state alive.
+      */
+      hideNativeModelMenusSoftly();
+    });
   }
 
   function toggleModelPopup() {
     state.popup.model = !state.popup.model;
 
     if (!state.popup.model) {
+      modelDiscoveryToken += 1;
+      modelDiscoveryInFlight = false;
       updatePopups();
       state.data.modelOptions = [];
       restoreNativeModelMenusSoftly();
@@ -2277,7 +3450,7 @@
   function selectRealModelOption(index) {
     const option = state.data.modelOptions && state.data.modelOptions[index];
 
-    if (!option || !option.label) {
+    if (!option || !option.label || !Array.isArray(option.path) || !option.path.length) {
       renderModelPopup("MODEL OPTION LOST. PRESS MODEL SELECT AGAIN.");
       return;
     }
@@ -2286,68 +3459,56 @@
 
     restoreNativeModelMenusSoftly();
 
-    const clickNow = () => {
-      /*
-        First, try to find the current live DOM option by label.
-        This is safer than clicking an old saved element.
-      */
-      let target = findOpenOptionByLabel(option.label);
-
-      if (!target && option.el && document.contains(option.el)) {
-        target = option.el;
-      }
-
-      if (target) {
-        hardClick(target);
-
-        setTimeout(() => {
-          state.popup.model = false;
-          updatePopups();
-          state.data.modelOptions = [];
-          restoreNativeModelMenusSoftly();
-          scheduleSync(350);
-        }, 360);
-
+    const finishSelection = (selected) => {
+      if (!selected) {
+        renderModelPopup(`FAILED TO FOLLOW REAL MENU PATH: ${option.path.join(" > ")}`);
         return;
       }
-
-      /*
-        If the real menu closed, reopen it and try again.
-      */
-      const btn = findRealModelButton();
-
-      if (!btn) {
-        renderModelPopup(`FAILED TO SWITCH: REAL MODEL BUTTON LOST FOR ${option.label}`);
-        return;
-      }
-
-      hardClick(btn);
 
       setTimeout(() => {
-        const reopenedTarget = findOpenOptionByLabel(option.label);
-
-        if (!reopenedTarget) {
-          renderModelPopup(`FAILED TO FIND REAL OPTION AFTER REOPEN: ${option.label}`);
-          return;
-        }
-
-        hardClick(reopenedTarget);
-
-        setTimeout(() => {
-          state.popup.model = false;
-          updatePopups();
-          state.data.modelOptions = [];
-          restoreNativeModelMenusSoftly();
-          scheduleSync(350);
-        }, 360);
-      }, 420);
+        state.popup.model = false;
+        updatePopups();
+        state.data.modelOptions = [];
+        restoreNativeModelMenusSoftly();
+        scheduleSync(350);
+      }, 360);
     };
 
-    requestAnimationFrame(() => {
-      setTimeout(clickNow, 0);
-    });
+    const selectFromOpenMenu = () => {
+      const menu = findPrimaryNativeModelMenu();
+
+      if (!menu) {
+        finishSelection(false);
+        return;
+      }
+
+      clickNativeModelPath(menu, option.path, 0, finishSelection);
+    };
+
+    const openMenu = findPrimaryNativeModelMenu();
+
+    if (openMenu) {
+      selectFromOpenMenu();
+      return;
+    }
+
+    const btn = findRealModelButton();
+
+    if (!btn) {
+      renderModelPopup(`FAILED TO SWITCH: REAL MODEL BUTTON LOST FOR ${option.label}`);
+      return;
+    }
+
+    hardClick(btn);
+    setTimeout(selectFromOpenMenu, 420);
   }
   function isChatGPTThinking() {
+    const nativeDictateState = detectNativeDictateState();
+
+    if (state.popup.dictate || nativeDictateState.active) {
+      return false;
+    }
+
     const stopBtn = engineQsAll(
       [
         '[data-testid="stop-button"]',
@@ -2393,6 +3554,36 @@
   }
 
   function forceOpenThinking() {
+    engineQsAll("details").forEach((d) => {
+      const label = getElementLabelText(d).slice(0, 240);
+
+      if (looksLikeThinkingTrigger(label)) {
+        d.open = true;
+        d.setAttribute("open", "");
+      }
+    });
+
+    engineQsAll(THINKING_TRIGGER_SELECTOR).forEach((el) => {
+      const label = getElementLabelText(el);
+
+      if (looksLikeThinkingTrigger(label) && el.getAttribute("aria-expanded") !== "true") {
+        try { el.click(); } catch (_) {}
+      }
+    });
+
+    if (!getActivityThinkingPanels().length) {
+      engineQsAll('button, [role="button"]').some((el) => {
+        const label = getElementLabelText(el);
+        if (!/\b(Activity|Thinking|Reasoning|Thought)\b/i.test(label)) return false;
+        if (/close|cancel|stop/i.test(label)) return false;
+
+        try { el.click(); } catch (_) {}
+        return true;
+      });
+    }
+
+    return;
+
     engineQsAll("details").forEach((d) => {
       const label = txt(d).slice(0, 180);
 
@@ -2600,24 +3791,181 @@
     return /(thinking|reasoning|reasoned|thought|analyz|analysis|search|reading|browse|tool|思考|推理|分析|搜索|检索|浏览|读取|工具)/i.test(String(raw || ""));
   }
 
+  function looksLikeThinkingTrigger(raw) {
+    return /(thinking|reasoning|reasoned|thought|thought for|思考|推理|已思考|已推理)/i.test(String(raw || ""));
+  }
+
+  function looksLikeThinkingSignal(raw) {
+    return /(thinking|reasoning|reasoned|reason|thought|analysis|analyz|思考|推理|分析)/i.test(String(raw || ""));
+  }
+
+  function getThinkingElementMeta(el) {
+    if (!el || !el.getAttribute) return "";
+
+    return [
+      el.getAttribute("aria-label") || "",
+      el.getAttribute("data-testid") || "",
+      typeof el.className === "string" ? el.className : ""
+    ].join(" ");
+  }
+
+  function getElementLabelText(el) {
+    if (!el) return "";
+
+    return cleanThinkingText([
+      txt(el),
+      getThinkingElementMeta(el)
+    ].join(" "));
+  }
+
+  function stripLeadingThinkingLabels(content, labels) {
+    let out = cleanThinkingText(content);
+
+    labels
+      .map(cleanThinkingText)
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length)
+      .forEach((label) => {
+        if (out === label) {
+          out = "";
+          return;
+        }
+
+        if (out.startsWith(label)) {
+          out = out.slice(label.length).trim();
+        }
+      });
+
+    return cleanThinkingText(out);
+  }
+
+  function extractThinkingContentText(root) {
+    if (!root) return "";
+
+    const blockTags = new Set([
+      "P", "DIV", "LI", "UL", "OL", "SECTION", "ARTICLE",
+      "BLOCKQUOTE", "H1", "H2", "H3", "H4", "H5", "H6",
+      "DETAILS", "PRE"
+    ]);
+
+    let text = "";
+
+    const walk = (node) => {
+      if (!node || isMine(node)) return;
+
+      if (node.nodeType === Node.TEXT_NODE) {
+        text += node.nodeValue || "";
+        return;
+      }
+
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+      const el = node;
+      const tag = el.tagName;
+
+      if (["SCRIPT", "STYLE", "SVG", "BUTTON", "SUMMARY"].includes(tag)) return;
+      if (blockTags.has(tag) && text && !text.endsWith("\n")) text += "\n";
+
+      Array.from(el.childNodes || []).forEach(walk);
+
+      if (tag === "LI") text += "\n";
+      if (blockTags.has(tag) && text && !text.endsWith("\n")) text += "\n";
+    };
+
+    walk(root);
+
+    return cleanThinkingText(text || root.textContent || "");
+  }
+
+  function getControlledElement(el) {
+    if (!el || !el.getAttribute) return null;
+
+    const id = el.getAttribute("aria-controls");
+    if (!id) return null;
+
+    try {
+      return document.getElementById(id) || document.querySelector(`#${CSS.escape(id)}`);
+    } catch (_) {
+      return document.getElementById(id);
+    }
+  }
+
+  function thinkingCandidateHasContent(el, labels = []) {
+    const content = stripLeadingThinkingLabels(extractThinkingContentText(el), labels);
+    return content.length >= 3;
+  }
+
+  function findThinkingContentRoot(trigger) {
+    if (!trigger) return null;
+
+    const details = trigger.closest && trigger.closest("details");
+    if (details) return details;
+
+    const label = getElementLabelText(trigger);
+    const controlled = getControlledElement(trigger);
+    if (thinkingCandidateHasContent(controlled, [label])) return controlled;
+
+    const nearestTagged = trigger.closest && trigger.closest([
+      '[data-testid*="thinking" i]',
+      '[data-testid*="reasoning" i]',
+      '[data-testid*="reason" i]',
+      '[data-testid*="thought" i]',
+      '[class*="thinking" i]',
+      '[class*="reasoning" i]',
+      '[class*="reason" i]',
+      '[class*="thought" i]'
+    ].join(", "));
+
+    if (thinkingCandidateHasContent(nearestTagged, [label])) return nearestTagged;
+
+    const article = trigger.closest && trigger.closest('[data-message-author-role="assistant"], article');
+    let node = trigger;
+    let depth = 0;
+
+    while (node && node.parentElement && node.parentElement !== article && depth < 8) {
+      const siblings = [
+        node.nextElementSibling,
+        node.previousElementSibling,
+        node.parentElement.nextElementSibling,
+        node.parentElement
+      ];
+
+      const found = siblings.find((candidate) => {
+        if (!candidate || candidate === trigger) return false;
+        if (article && isInsideConversationMessage(candidate) && !article.contains(candidate)) return false;
+        return thinkingCandidateHasContent(candidate, [label]);
+      });
+
+      if (found) return found;
+
+      node = node.parentElement;
+      depth += 1;
+    }
+
+    return null;
+  }
+
   function looksLikeNonThinkingUi(raw) {
     return /(model|selector|sidebar|history|conversation|menu|gpt|o3|o4|4o|share|copy|edit|retry|模型|侧边栏|历史|菜单)/i.test(String(raw || ""));
   }
 
-  function extractThinkingBlock(el) {
+  function extractThinkingBlock(el, triggerEl = null) {
     if (!el) return null;
 
     const summary = el.matches && el.matches("details")
       ? el.querySelector("summary")
       : null;
 
+    const triggerText = getElementLabelText(triggerEl);
     const aria = el.getAttribute ? el.getAttribute("aria-label") || "" : "";
     const testid = el.getAttribute ? el.getAttribute("data-testid") || "" : "";
+    const meta = getThinkingElementMeta(el);
 
     const fullText = cleanThinkingText(el.innerText || el.textContent || "");
     const summaryText = cleanThinkingText(summary ? (summary.innerText || summary.textContent || "") : "");
 
     const title =
+      cleanThinkingTitle(triggerText) ||
       cleanThinkingTitle(summaryText) ||
       cleanThinkingTitle(aria) ||
       cleanThinkingTitle(fullText) ||
@@ -2625,28 +3973,168 @@
 
     if (!title && !fullText) return null;
 
-    const combined = `${title}\n${fullText}\n${aria}\n${testid}`;
+    const signal = `${title}\n${aria}\n${testid}\n${meta}\n${triggerText}`;
 
-    if (!looksLikeThinkingText(combined)) return null;
+    if (!looksLikeThinkingSignal(signal) && !looksLikeThinkingTrigger(signal)) return null;
     if (looksLikeNonThinkingUi(title) && !looksLikeThinkingText(fullText)) return null;
 
-    let content = fullText;
-
-    if (summaryText && content.startsWith(summaryText)) {
-      content = content.slice(summaryText.length).trim();
-    }
+    let content = extractThinkingContentText(el) || fullText;
+    content = stripLeadingThinkingLabels(content, [triggerText, summaryText, title]);
 
     if (!content || content.length < 3) {
-      content = fullText || title;
+      return null;
     }
 
     return {
       title: title || "visible thinking",
-      content: content || title || "visible thinking"
+      content
     };
   }
 
+  function isActivityThinkingPanel(el) {
+    if (!el || isMine(el)) return false;
+
+    const meta = getThinkingElementMeta(el);
+    if (/screen-threadFlyOut|Reasoning details|chat-screen-cot|cot-mobile/i.test(meta)) {
+      return true;
+    }
+
+    const text = cleanThinkingText(el.innerText || el.textContent || "").slice(0, 700);
+    return /\bActivity\b/i.test(text) && /\bThinking\b/i.test(text);
+  }
+
+  function getActivityThinkingPanels() {
+    const seen = new Set();
+    const panels = [];
+
+    engineQsAll(ACTIVITY_PANEL_SELECTOR).forEach((el) => {
+      if (!isActivityThinkingPanel(el)) return;
+
+      const panel = el.closest('[data-testid="screen-threadFlyOut"], section[aria-label="Reasoning details"], [role="dialog"][aria-modal="true"]') || el;
+      if (!panel || seen.has(panel)) return;
+
+      seen.add(panel);
+      panels.push(panel);
+    });
+
+    return panels;
+  }
+
+  function isActivityUiLabel(text) {
+    const value = cleanThinkingText(text);
+
+    return /^(Thinking|Close|Cycle)$/i.test(value) || /^Activity\b/i.test(value);
+
+    return /^(Activity|Thinking|Close|Cycle)(\s*·\s*\d|\s*)?$/i.test(cleanThinkingText(text));
+  }
+
+  function findActivityTimelineEntry(markdown, panel) {
+    let node = markdown ? markdown.parentElement : null;
+    let depth = 0;
+
+    while (node && node !== panel && depth < 8) {
+      const hasMarkdown = node.querySelector && node.querySelector(ACTIVITY_MARKDOWN_SELECTOR);
+      const hasTitle = node.querySelector && node.querySelector(ACTIVITY_TITLE_SELECTOR);
+
+      if (hasMarkdown && hasTitle) return node;
+
+      node = node.parentElement;
+      depth += 1;
+    }
+
+    return markdown ? markdown.parentElement : null;
+  }
+
+  function extractActivityEntryTitle(entry, markdown) {
+    if (!entry) return "";
+
+    const markdownText = cleanThinkingText(markdown ? (markdown.innerText || markdown.textContent || "") : "");
+    const titles = qsAll(ACTIVITY_TITLE_SELECTOR, entry)
+      .map((el) => cleanThinkingTitle(el.innerText || el.textContent || ""))
+      .filter((title) => {
+        if (!title || title.length < 2) return false;
+        if (isActivityUiLabel(title)) return false;
+        if (markdownText && markdownText.includes(title)) return false;
+
+        return true;
+      });
+
+    return titles[0] || "Thinking";
+  }
+
+  function collectActivityThinkingModules() {
+    const seen = new Set();
+    const modules = [];
+
+    getActivityThinkingPanels().forEach((panel) => {
+      qsAll(ACTIVITY_MARKDOWN_SELECTOR, panel).forEach((markdown) => {
+        if (!markdown || isMine(markdown)) return;
+
+        const content = cleanThinkingText(markdown.innerText || markdown.textContent || "");
+        if (!content || content.length < 3) return;
+        if (isActivityUiLabel(content)) return;
+
+        const entry = findActivityTimelineEntry(markdown, panel);
+        const title = extractActivityEntryTitle(entry, markdown);
+        const key = `${title}\n${content}`.toLowerCase();
+
+        if (seen.has(key)) return;
+        seen.add(key);
+
+        modules.push({
+          title,
+          content
+        });
+      });
+    });
+
+    return modules.slice(-8);
+  }
+
   function collectVisibleThinkingModules() {
+    const activityModules = collectActivityThinkingModules();
+    if (activityModules.length) return activityModules;
+
+    {
+      const seen = new Set();
+      const modules = [];
+
+      const addBlock = (root, trigger = null) => {
+        if (!root) return;
+
+        const label = getElementLabelText(trigger);
+        if (!usableDomNode(root) && !thinkingCandidateHasContent(root, [label])) return;
+
+        const block = extractThinkingBlock(root, trigger);
+        if (!block) return;
+
+        const key = `${block.title}\n${block.content}`.toLowerCase();
+
+        if (seen.has(key)) return;
+        seen.add(key);
+
+        modules.push(block);
+      };
+
+      engineQsAll(THINKING_NODE_SELECTOR).forEach((el) => {
+        const trigger = el.matches && el.matches("details")
+          ? el.querySelector("summary")
+          : qsAll("summary, button, [role='button'], [aria-expanded], [aria-controls]", el)
+            .find((node) => looksLikeThinkingTrigger(getElementLabelText(node)));
+
+        addBlock(el, trigger);
+      });
+
+      engineQsAll(THINKING_TRIGGER_SELECTOR).forEach((trigger) => {
+        const label = getElementLabelText(trigger);
+        if (!looksLikeThinkingTrigger(label)) return;
+
+        addBlock(findThinkingContentRoot(trigger), trigger);
+      });
+
+      return modules.slice(-8);
+    }
+
     const nodes = engineQsAll([
       'main details',
       'main [data-testid*="thinking" i]',
@@ -2917,10 +4405,23 @@
     const inlineDraft = readInlineDraft();
     const nativePrompt = getDockedNativePrompt() || findNativePromptOutsideShell();
     const nativeDraft = nativePrompt ? readPromptValue(nativePrompt) : "";
+    let draft = inlineDraft;
 
-    const draft = state.popup.chatbox
-      ? (nativeDraft || inlineDraft)
-      : (inlineDraft || nativeDraft);
+    if (state.popup.chatbox && nativePrompt) {
+      draft = nativeDraft;
+
+      if (nativeDraft !== inlineDraft) {
+        setInlineDraftValue(nativeDraft, true);
+      }
+    } else if (
+      state.popup.dictate &&
+      nativePrompt &&
+      nativeDraft !== inlineDraft &&
+      (nativeDraft.length > 0 || dictateBaselineDraft.length === 0)
+    ) {
+      draft = nativeDraft;
+      setInlineDraftValue(nativeDraft, true);
+    }
 
     let modelLabel = "MODEL";
     const modelBtn = engineQsAll('button, [role="button"]').find((el) => {
@@ -3134,6 +4635,7 @@
       varying vec2 v_uv;
       uniform sampler2D u_tex;
       uniform float u_curve;
+      uniform float u_time;
 
       vec2 curve(vec2 uv) {
         vec2 p = uv * 2.0 - 1.0;
@@ -3157,10 +4659,41 @@
 
         vec4 color = texture2D(u_tex, vec2(uv.x, 1.0 - uv.y));
 
-        float d = distance(v_uv, vec2(0.5, 0.5));
-        float vignette = 1.0 - smoothstep(0.55, 0.92, d);
+        // 使用弯曲后的 uv，使暗场沿弯曲屏幕边缘分布。
+        vec2 edgeAxis = abs(uv * 2.0 - 1.0);
+        float edgePosition = max(edgeAxis.x, edgeAxis.y);
 
-        color.rgb *= (0.86 + vignette * 0.20);
+        // 原来的整体明暗参数。
+        float edgeVignette =
+          1.0 - smoothstep(0.65, 0.92, edgePosition);
+
+        color.rgb *= 0.86 + edgeVignette * 0.60;
+
+        // 原来的额外暗角参数，现在均匀覆盖四边。
+
+        vec2 cornerAxis = abs(v_uv * 2.0 - 1.0);
+        float cornerMask = smoothstep(0.67, 0.94, cornerAxis.x * cornerAxis.y);
+        color.rgb *= 1.0 - cornerMask * 0.7;
+
+        float edgePosition1 = abs(uv.x * 2.0 - 1.0);
+
+        float edgeMask =
+          smoothstep(0.96, 0.99, edgePosition1);
+
+        color.rgb *= 1.0 - edgeMask * 0.95;
+
+        float sweep = mod(u_time * 0.18, 1.36);
+        float scanY = 1.10 - sweep;
+        float scanDelta = v_uv.y - scanY;
+        float leadingEdge = smoothstep(-0.022, 0.038, scanDelta);
+        float upperFade = 1.0 - smoothstep(0.0, 0.34, scanDelta);
+        float refreshField = leadingEdge * upperFade;
+        float fieldTexture = 0.96 + 0.04 * sin((v_uv.y + u_time * 0.012) * 150.0);
+        vec3 scanAmber = vec3(1.0, 0.54, 0.02);
+
+        refreshField *= fieldTexture;
+        color.rgb += scanAmber * refreshField * 0.075;
+        color.rgb *= 1.0 + refreshField * 0.095;
 
         gl_FragColor = color;
       }
@@ -3198,7 +4731,8 @@
     gl.useProgram(program);
     glUniforms = {
       curve: gl.getUniformLocation(program, "u_curve"),
-      tex: gl.getUniformLocation(program, "u_tex")
+      tex: gl.getUniformLocation(program, "u_tex"),
+      time: gl.getUniformLocation(program, "u_time")
     };
 
     if (glUniforms.tex) {
@@ -3349,12 +4883,19 @@
   }
 
   function drawGlowText(ctx, text, x, y, color, font) {
+    ctx.save();
     ctx.font = font;
     ctx.fillStyle = color;
     ctx.shadowColor = color;
-    ctx.shadowBlur = 10 * dpr;
+
+    ctx.globalAlpha = 0.18;
+    ctx.shadowBlur = 20 * dpr;
     ctx.fillText(text, x, y);
-    ctx.shadowBlur = 0;
+
+    ctx.globalAlpha = 1;
+    ctx.shadowBlur = 14 * dpr;
+    ctx.fillText(text, x, y);
+    ctx.restore();
   }
 
   function drawRetroCenteredText(ctx, text, centerX, centerY, font, color) {
@@ -3369,34 +4910,60 @@
     ctx.restore();
   }
 
-  function drawCopyButtonLine(ctx, text, x, y, width, height, font) {
+  function drawOracleHighlightRect(ctx, x, y, width, height, glowBlur = 18) {
     ctx.save();
 
+    const verticalFill = ctx.createLinearGradient(0, y, 0, y + height);
+    verticalFill.addColorStop(0, "#e5ad08");
+    verticalFill.addColorStop(0.2, "#f3bf08");
+    verticalFill.addColorStop(0.5, COLORS.select);
+    verticalFill.addColorStop(0.8, "#f3bf08");
+    verticalFill.addColorStop(1, "#e5ad08");
+
     ctx.shadowColor = COLORS.selectGlow;
-    ctx.shadowBlur = 18 * dpr;
-    ctx.fillStyle = COLORS.select;
-    ctx.fillRect(x, y + 2 * dpr, width, Math.max(1, height - 4 * dpr));
+    ctx.shadowBlur = glowBlur * dpr;
+    ctx.fillStyle = verticalFill;
+    ctx.fillRect(x, y, width, height);
+
+    const sideShade = ctx.createLinearGradient(x, 0, x + width, 0);
+    sideShade.addColorStop(0, "rgba(102, 48, 0, 0.18)");
+    sideShade.addColorStop(0.08, "rgba(102, 48, 0, 0)");
+    sideShade.addColorStop(0.92, "rgba(102, 48, 0, 0)");
+    sideShade.addColorStop(1, "rgba(102, 48, 0, 0.18)");
 
     ctx.shadowBlur = 0;
-    ctx.strokeStyle = COLORS.selectHot;
+    ctx.fillStyle = sideShade;
+    ctx.fillRect(x, y, width, height);
+
+    ctx.strokeStyle = "rgba(229, 173, 8, 0.82)";
     ctx.lineWidth = 1 * dpr;
     ctx.strokeRect(
       x + 0.5 * dpr,
-      y + 2.5 * dpr,
-      width - 1 * dpr,
-      Math.max(1, height - 5 * dpr)
+      y + 0.5 * dpr,
+      Math.max(1, width - 1 * dpr),
+      Math.max(1, height - 1 * dpr)
     );
 
     ctx.restore();
+  }
 
-    drawRetroCenteredText(
-      ctx,
-      text,
-      x + width / 2,
-      y + height / 2,
-      font,
-      "#050200"
-    );
+  function drawCopyButtonLine(ctx, text, x, y, width, height, font) {
+    const top = y + 2 * dpr;
+    const buttonHeight = Math.max(1, height - 4 * dpr);
+    const centerY = top + buttonHeight / 2;
+
+    drawOracleHighlightRect(ctx, x, top, width, buttonHeight, 18);
+
+    ctx.save();
+    ctx.font = font;
+    ctx.fillStyle = "#090400";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.shadowColor = "transparent";
+    ctx.shadowBlur = 0;
+    ctx.fillText(text, x + width / 2, centerY);
+
+    ctx.restore();
   }
 
   function copyTextToClipboard(text) {
@@ -3487,10 +5054,16 @@
     const wrapped = wrapCodeText(full, contentW, ctx);
 
     wrapped.forEach((ln, idx) => {
+      const cursorOffset = cursor === "█" ? ln.indexOf(cursor) : -1;
+      const text = cursorOffset >= 0
+        ? `${ln.slice(0, cursorOffset)} ${ln.slice(cursorOffset + cursor.length)}`
+        : ln;
+
       lines.push({
-        text: ln,
+        text,
         color: COLORS.amberHot,
-        head: idx === 0
+        head: idx === 0,
+        cursorOffset
       });
     });
   }
@@ -3568,7 +5141,7 @@
 
     state.data.messages.forEach((msg, idx) => {
       const head = msg.role === "user"
-        ? "user@oracle ~]$"
+        ? "[user@oracle ~]#"
         : `oracle[${idx + 1}]>`;
 
       lines.push({
@@ -3605,7 +5178,7 @@
         wrapped.forEach((ln) => {
           lines.push({
             text: ln,
-            color: COLORS.amber,
+            color: msg.role === "assistant" ? COLORS.answer : COLORS.amber,
             head: false
           });
         });
@@ -3722,14 +5295,36 @@
             fonts.copyButton
           );
         } else {
+          const lineFont = line.code ? fonts.code : (line.head ? fonts.head : fonts.body);
+
           drawGlowText(
             offctx,
             line.text,
             layout.padX,
             y,
             line.color,
-            line.code ? fonts.code : (line.head ? fonts.head : fonts.body)
+            lineFont
           );
+
+          if (line.cursorOffset >= 0) {
+            offctx.save();
+            offctx.font = lineFont;
+
+            const beforeCursor = line.text.slice(0, line.cursorOffset);
+            const cursorX = layout.padX + offctx.measureText(beforeCursor).width;
+            const cursorWidth = Math.max(8 * dpr, offctx.measureText("█").width);
+
+            drawOracleHighlightRect(
+              offctx,
+              cursorX,
+              y + 0 * dpr,
+              cursorWidth,
+              17 * dpr,
+              10
+            );
+
+            offctx.restore();
+          }
         }
       }
 
@@ -3777,7 +5372,7 @@
 
     pushWrappedPromptLines(
       lines,
-      "user@oracle ~]$ ",
+      "[user@oracle ~]# ",
       draft,
       cursor,
       contentW,
@@ -3820,19 +5415,21 @@
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, offscreen);
 
     if (glUniforms.curve) {
-      gl.uniform1f(glUniforms.curve, 0.11);
+      gl.uniform1f(glUniforms.curve, 0.06);
+    }
+
+    if (glUniforms.time) {
+      gl.uniform1f(glUniforms.time, performance.now() * 0.001);
     }
 
     gl.clearColor(0, 0, 0, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
 
-    if (
-      (state.data.isThinking || state.inputFocused) &&
-      document.documentElement.classList.contains(ROOT_CLASS)
-    ) {
-      const delay = state.data.isThinking ? 140 : 520;
-      setTimeout(requestRender, delay);
+    if (document.documentElement.classList.contains(ROOT_CLASS)) {
+      const delay = state.data.isThinking ? 80 : 48;
+      clearTimeout(renderLoopTimer);
+      renderLoopTimer = setTimeout(requestRender, delay);
     }
   }
 
@@ -3922,6 +5519,29 @@
 
     setInterval(() => {
       if (!document.documentElement.classList.contains(ROOT_CLASS)) return;
+
+      if (!state.popup.dictate) {
+        const nativeDictateState = detectNativeDictateState();
+        if (
+          nativeDictateState.active &&
+          performance.now() >= dictateDetectionSuppressUntil
+        ) {
+          adoptNativeDictateState(nativeDictateState);
+        }
+      } else if (dictateNativeConfirmed) {
+        const nativeDictateState = detectNativeDictateState();
+
+        if (nativeDictateState.active) {
+          dictateNativeMissingSince = 0;
+        } else if (!dictateNativeMissingSince) {
+          dictateNativeMissingSince = performance.now();
+        } else if (performance.now() - dictateNativeMissingSince > 900) {
+          dictateNativeConfirmed = false;
+          dictateNativeMissingSince = 0;
+          stopDictateAudio();
+          setDictateStatus("NATIVE DICTATE STATE LOST");
+        }
+      }
 
       if (!state.inputFocused) {
         scheduleSync(state.data.isThinking ? 180 : 900);
